@@ -8,6 +8,7 @@ GoTorrent is a BitTorrent client written in Go. It implements torrent parsing, t
 
 - `.torrent` parsing with raw `info` dict hashing
 - concurrent HTTP and UDP tracker discovery with bounded fallback
+- periodic tracker reannounce using tracker-provided intervals
 - TCP peer handshake, connection diagnostics, and BitTorrent wire protocol
 - rarest-first piece selection with endgame fallback
 - SHA1 verification and disk writes
@@ -24,6 +25,7 @@ internal/torrent/     Torrent metainfo parsing and infohash logic
 internal/tracker/     Concurrent HTTP/UDP announces and peer discovery
 internal/peer/        Handshake, wire messages, and peer connections
 internal/piece/       Scheduling, verification, writer, and resume state
+internal/session/     Periodic discovery and live peer injection
 internal/webseed/     HTTP WebSeed sources
 internal/tui/         Bubble Tea UI
 ```
@@ -71,12 +73,17 @@ flowchart TD
     J -->|none| X[Detailed source error]
     F --> I
     I --> K[Peer blocks or HTTP pieces]
+    I --> O[Periodic tracker reannounce]
+    O --> P[Connect and inject new peers]
+    P --> I
     K --> L[SHA1 verification]
     L --> M[Disk write]
     M --> N[Completion map and .gtstate]
 ```
 
 Tracker announces return candidate addresses, not guaranteed connections. GoTorrent first announces to every tracker concurrently with a three-second budget. If no peer connects and no WebSeed is available, it performs one ten-second fallback announce, merges and deduplicates both peer sets, and attempts one final connection batch.
+
+During a download, GoTorrent reannounces using the tracker-provided interval. Periodic requests include current verified `downloaded` and `left` values, omit the startup event, and use a ten-second request timeout. Newly returned addresses are deduplicated against previously attempted peers; successful connections are added to the active piece manager without restarting the download. Failed periodic rounds retry after five minutes.
 
 The client uses one peer ID for tracker announces and all handshakes. Once a peer connection starts, one writer goroutine serializes every outbound wire message.
 
@@ -86,7 +93,6 @@ Progress and throughput are intentionally separate: verified piece bytes drive c
 
 - DHT
 - PEX
-- periodic tracker reannounce
 - magnet links
 - BitTorrent v2
 - uTP
