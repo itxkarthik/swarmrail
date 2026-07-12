@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"go-torrent/internal/bencode"
 )
@@ -26,75 +27,100 @@ func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port u
 
 // AnnounceHTTPContext sends an HTTP announce that can be cancelled by ctx.
 func AnnounceHTTPContext(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
+	response, err := announceHTTP(ctx, announceURL, AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   peerID,
+		Port:     port,
+		Left:     uint64(totalLength),
+		Event:    EventStarted,
+	})
+	return response.Peers, err
+}
+
+func announceHTTP(ctx context.Context, announceURL string, request AnnounceRequest) (AnnounceResponse, error) {
 	// Parse the announce URL
 	parsedURL, err := url.Parse(announceURL)
 	if err != nil {
-		return nil, err
+		return AnnounceResponse{}, err
 	}
 	// Set the query parameters
 	query := parsedURL.Query()
-	query.Set("info_hash", string(infoHash[:]))
-	query.Set("peer_id", string(peerID[:]))
-	query.Set("port", fmt.Sprintf("%d", port))
-	query.Set("uploaded", "0")
-	query.Set("downloaded", "0")
-	query.Set("left", fmt.Sprintf("%d", totalLength))
+	query.Set("info_hash", string(request.InfoHash[:]))
+	query.Set("peer_id", string(request.PeerID[:]))
+	query.Set("port", fmt.Sprintf("%d", request.Port))
+	query.Set("uploaded", fmt.Sprintf("%d", request.Uploaded))
+	query.Set("downloaded", fmt.Sprintf("%d", request.Downloaded))
+	query.Set("left", fmt.Sprintf("%d", request.Left))
 	query.Set("compact", "1")
+	if event := request.Event.HTTPValue(); event != "" {
+		query.Set("event", event)
+	} else {
+		query.Del("event")
+	}
 	// Encode the query parameters and set the URL
 	parsedURL.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
 	if err != nil {
-		return nil, err
+		return AnnounceResponse{}, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return AnnounceResponse{}, err
 	}
 	// Close the response body when done
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("tracker returned HTTP %s", resp.Status)
+		return AnnounceResponse{}, fmt.Errorf("tracker returned HTTP %s", resp.Status)
 	}
 	// Read the response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return AnnounceResponse{}, err
 	}
 	// Parse the response body
 	return parseHTTPResponse(body)
 }
 
 // parseHTTPResponse parses the HTTP response body and returns a list of peers.
-func parseHTTPResponse(body []byte) ([]Peer, error) {
+func parseHTTPResponse(body []byte) (AnnounceResponse, error) {
 	// Decode the response body
 	decoded, _, err := bencode.Decode(body)
 	if err != nil {
-		return nil, err
+		return AnnounceResponse{}, err
 	}
 
 	// Check the response type
 	top, ok := decoded.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("invalid tracker response: expected dict")
+		return AnnounceResponse{}, fmt.Errorf("invalid tracker response: expected dict")
 	}
 	if failure, ok := top["failure reason"].(string); ok {
-		return nil, fmt.Errorf("tracker failure: %s", failure)
+		return AnnounceResponse{}, fmt.Errorf("tracker failure: %s", failure)
 	}
 
 	// Check for peers in the response
 	peersVal, ok := top["peers"]
 	if !ok {
-		return nil, fmt.Errorf("invalid tracker response: missing peers")
+		return AnnounceResponse{}, fmt.Errorf("invalid tracker response: missing peers")
+	}
+	interval := DefaultAnnounceInterval
+	if seconds, ok := top["interval"].(int64); ok && seconds > 0 {
+		interval = time.Duration(seconds) * time.Second
+	}
+	if seconds, ok := top["min interval"].(int64); ok && seconds > 0 {
+		interval = max(interval, time.Duration(seconds)*time.Second)
 	}
 
 	// Unmarshal the peers based on their type
 	switch peers := peersVal.(type) {
 	case string:
-		return unmarshalCompactPeers([]byte(peers))
+		parsed, err := unmarshalCompactPeers([]byte(peers))
+		return AnnounceResponse{Peers: parsed, Interval: interval}, err
 	case []any:
-		return unmarshalPeerList(peers)
+		parsed, err := unmarshalPeerList(peers)
+		return AnnounceResponse{Peers: parsed, Interval: interval}, err
 	default:
-		return nil, fmt.Errorf("invalid tracker response: unsupported peers type %T", peersVal)
+		return AnnounceResponse{}, fmt.Errorf("invalid tracker response: unsupported peers type %T", peersVal)
 	}
 }
 

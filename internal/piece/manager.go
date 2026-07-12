@@ -54,7 +54,9 @@ type Manager struct {
 	infoHash [20]byte // for matching saved state
 
 	// Upload support
-	pw *PieceWriter // set during Download for serving uploaded pieces
+	pw          *PieceWriter // set during Download for serving uploaded pieces
+	downloadCtx context.Context
+	downloading bool
 
 	// Status output
 	logWriter io.Writer // status messages (stderr by default, silenced in TUI mode)
@@ -119,41 +121,45 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 	if err != nil {
 		return fmt.Errorf("creating piece writer: %w", err)
 	}
-	defer pw.Close()
-	m.pw = pw
-
-	// Set up upload handlers on all peers so they can request pieces from us.
-	m.initUpload()
-
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	m.mu.Lock()
+	m.pw = pw
+	m.downloadCtx = ctx
+	m.downloading = true
+	initialPeers := append([]*peer.PeerConnection(nil), m.peers...)
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		m.mu.Lock()
+		m.downloading = false
+		m.downloadCtx = nil
+		m.pw = nil
+		m.mu.Unlock()
+		pw.Close()
+	}()
 
-	// Workers: one per peer and one per webseed, sharing the same collector.
-	var wg sync.WaitGroup
-	for _, p := range m.peers {
-		wg.Go(func() {
-			m.worker(p)
-		})
+	// Keep the result channel open so peers discovered by periodic tracker
+	// announces can join the active download and submit verified pieces.
+	for _, p := range initialPeers {
+		m.initPeerUpload(p)
+		go m.worker(ctx, p)
 	}
 	for _, source := range m.webseeds {
-		wg.Go(func() {
-			m.webseedWorker(ctx, source)
-		})
+		go m.webseedWorker(ctx, source)
 	}
-
-	// Close piece results when all workers exit
-	go func() {
-		wg.Wait()
-		close(m.pieceResults)
-	}()
 
 	// Collector: read piece results, write to file, and track progress
 	completedPieces := CountCompleted(m.Completed())
 	lastSaveCount := completedPieces
 
-	for result := range m.pieceResults {
+	for completedPieces < m.totalPieces {
+		var result PieceResult
+		select {
+		case result = <-m.pieceResults:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		if result.Err != nil {
-			cancel()
 			return result.Err
 		}
 		if result.Index >= uint32(len(m.completed)) || m.isCompleted(result.Index) {
@@ -188,58 +194,49 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 		fmt.Fprintln(m.logWriter)
 	}
 
-	if !m.allCompleted() {
-		return fmt.Errorf("download incomplete: completed %d/%d pieces", CountCompleted(m.completed), m.totalPieces)
-	}
 	return nil
 }
 
-// initUpload sets up upload handling on all peer connections:
-//  1. registers the getPieceData callback so the writer goroutine can
-//     respond to remote peer requests by reading from disk
-//  2. sends our bitfield to each peer so they know what pieces we have
-func (m *Manager) initUpload() {
-	bitfieldBytes := peer.BuildBitfieldBytes(m.completed)
+func (m *Manager) initPeerUpload(p *peer.PeerConnection) {
+	p.SetPieceDataHandler(func(work peer.PieceWork) ([]byte, bool) {
+		m.mu.Lock()
+		completed := int(work.Index) < len(m.completed) && m.completed[work.Index]
+		pw := m.pw
+		m.mu.Unlock()
 
-	for _, p := range m.peers {
-		p.SetPieceDataHandler(func(work peer.PieceWork) ([]byte, bool) {
-			m.mu.Lock()
-			completed := int(work.Index) < len(m.completed) && m.completed[work.Index]
-			m.mu.Unlock()
-
-			if !completed || m.pw == nil {
-				return nil, false
-			}
-
-			pieceSize := m.sizeOfPiece(work.Index)
-
-			// Clamp length to piece boundary
-			length := work.Length
-			if uint64(work.Begin)+uint64(length) > pieceSize {
-				length = int(pieceSize - uint64(work.Begin))
-			}
-			if length <= 0 {
-				return nil, false
-			}
-
-			data := make([]byte, length)
-			n, err := m.pw.ReadPiece(uint32(work.Index), data)
-			if err != nil || n != len(data) {
-				return nil, false
-			}
-			return data, true
-		})
-
-		// Send our bitfield so the peer knows what we have.
-		if len(bitfieldBytes) > 0 {
-			p.SendBitfield(bitfieldBytes)
+		if !completed || pw == nil {
+			return nil, false
 		}
+
+		pieceSize := m.sizeOfPiece(work.Index)
+
+		// Clamp length to piece boundary
+		length := work.Length
+		if uint64(work.Begin)+uint64(length) > pieceSize {
+			length = int(pieceSize - uint64(work.Begin))
+		}
+		if length <= 0 {
+			return nil, false
+		}
+
+		data := make([]byte, length)
+		n, err := pw.ReadPiece(uint32(work.Index), data)
+		if err != nil || n != len(data) {
+			return nil, false
+		}
+		return data, true
+	})
+
+	bitfieldBytes := peer.BuildBitfieldBytes(m.Completed())
+	// Send our bitfield so the peer knows what we have.
+	if len(bitfieldBytes) > 0 {
+		p.SendBitfield(bitfieldBytes)
 	}
 }
 
 // announceHave sends a Have message to all connected peers when we complete a piece.
 func (m *Manager) announceHave(index uint32) {
-	for _, p := range m.peers {
+	for _, p := range m.Peers() {
 		p.SendHave(index)
 	}
 }
@@ -264,8 +261,13 @@ func (m *Manager) nextPiece(p *peer.PeerConnection) int {
 // sends the verified piece to pieceResults. On corruption it loops
 // back to re-select the piece; on disconnection it exits so the peer's
 // in-progress pieces become available to other workers.
-func (m *Manager) worker(p *peer.PeerConnection) {
+func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		idx := m.nextPiece(p)
 		if idx == -1 {
 			return // no more work for this peer
@@ -297,9 +299,11 @@ func (m *Manager) worker(p *peer.PeerConnection) {
 			continue
 		}
 
-		m.pieceResults <- PieceResult{
-			Index: uint32(idx),
-			Data:  pieceData,
+		select {
+		case m.pieceResults <- PieceResult{Index: uint32(idx), Data: pieceData}:
+		case <-ctx.Done():
+			m.markNotInProgress(uint32(idx))
+			return
 		}
 	}
 }
@@ -552,6 +556,34 @@ func (m *Manager) SetPeers(peers []*peer.PeerConnection) {
 	m.peers = peers
 }
 
+// AddPeers appends newly discovered connections and starts workers immediately
+// when a download is active. It returns the number of accepted connections.
+func (m *Manager) AddPeers(peers []*peer.PeerConnection) int {
+	valid := make([]*peer.PeerConnection, 0, len(peers))
+	for _, p := range peers {
+		if p != nil {
+			valid = append(valid, p)
+		}
+	}
+	if len(valid) == 0 {
+		return 0
+	}
+
+	m.mu.Lock()
+	m.peers = append(m.peers, valid...)
+	ctx := m.downloadCtx
+	active := m.downloading && ctx != nil
+	m.mu.Unlock()
+
+	if active {
+		for _, p := range valid {
+			m.initPeerUpload(p)
+			go m.worker(ctx, p)
+		}
+	}
+	return len(valid)
+}
+
 // Completed returns a copy of the completed bitfield for external save.
 func (m *Manager) Completed() []bool {
 	m.mu.Lock()
@@ -576,6 +608,9 @@ func (m *Manager) TotalPieces() int { return m.totalPieces }
 
 // TotalLength returns the total size of the torrent in bytes.
 func (m *Manager) TotalLength() uint64 { return m.totalLength }
+
+// WebSeedCount returns the number of configured HTTP sources.
+func (m *Manager) WebSeedCount() int { return len(m.webseeds) }
 
 // CompletedBytes returns the exact number of verified bytes represented by the
 // completed bitfield. The final piece may be shorter than pieceLength.

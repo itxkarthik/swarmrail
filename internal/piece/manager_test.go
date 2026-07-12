@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha1"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go-torrent/internal/peer"
 	"go-torrent/internal/torrent"
@@ -106,6 +108,90 @@ func TestDownloadWebSeedOnly(t *testing.T) {
 	}
 	if string(data) != "abcdef" {
 		t.Fatalf("file = %q, want abcdef", data)
+	}
+}
+
+func TestDownloadAcceptsPeerAddedAtRuntime(t *testing.T) {
+	data := []byte("abcd")
+	hash := sha1.Sum(data)
+	tf := &torrent.TorrentFile{
+		Name:        "dynamic.bin",
+		Length:      int64(len(data)),
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{hash},
+	}
+
+	dormant, closeDormant := newServingPeer(t, []bool{false}, nil)
+	defer closeDormant()
+	m := NewManager(tf, []*peer.PeerConnection{dormant})
+	m.SetLogWriter(io.Discard)
+	dir := t.TempDir()
+	done := make(chan error, 1)
+	go func() { done <- m.Download(dir, true) }()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		active := m.downloading
+		m.mu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("download did not become active")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	dynamic, closeDynamic := newServingPeer(t, []bool{true}, data)
+	defer closeDynamic()
+	time.Sleep(20 * time.Millisecond)
+	if added := m.AddPeers([]*peer.PeerConnection{dynamic}); added != 1 {
+		t.Fatalf("AddPeers() = %d, want 1", added)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("download did not complete from runtime peer")
+	}
+
+	written, err := os.ReadFile(filepath.Join(dir, "dynamic.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != string(data) {
+		t.Fatalf("downloaded data = %q, want %q", written, data)
+	}
+}
+
+func newServingPeer(t *testing.T, bitfield []bool, pieceData []byte) (*peer.PeerConnection, func()) {
+	t.Helper()
+	client, server := net.Pipe()
+	connection := peer.NewPeerConnection(client, [20]byte{})
+	connection.SetBitfield(bitfield)
+	connection.Start()
+
+	go func() {
+		_ = peer.WriteMessage(server, &peer.Message{ID: peer.MsgUnchoke})
+		for {
+			msg, err := peer.ReadMessage(server)
+			if err != nil {
+				return
+			}
+			if msg == nil || msg.ID != peer.MsgRequest || len(pieceData) == 0 {
+				continue
+			}
+			_ = peer.WriteMessage(server, peer.BuildPiece(0, 0, pieceData))
+		}
+	}()
+
+	return connection, func() {
+		connection.Close()
+		server.Close()
 	}
 }
 

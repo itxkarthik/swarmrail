@@ -13,6 +13,7 @@ import (
 
 	"go-torrent/internal/peer"
 	"go-torrent/internal/piece"
+	"go-torrent/internal/session"
 	"go-torrent/internal/torrent"
 	"go-torrent/internal/tracker"
 	"go-torrent/internal/tui"
@@ -28,18 +29,19 @@ type connectPeersFunc func([]tracker.Peer) ([]*peer.PeerConnection, peer.Connect
 
 // announceToTracker announces to every tracker concurrently and combines their peers.
 // When quiet is true, per-tracker diagnostics are not printed to stderr.
-func announceToTracker(ctx context.Context, announceURLs []string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64, quiet bool) ([]tracker.Peer, error) {
-	peers, results, err := tracker.DiscoverPeers(ctx, announceURLs, infoHash, peerID, port, totalLength)
+func announceToTracker(ctx context.Context, announceURLs []string, request tracker.AnnounceRequest, quiet bool) (tracker.DiscoveryResult, error) {
+	discovery, err := tracker.Discover(ctx, announceURLs, request)
 	if !quiet {
-		for i, result := range results {
+		for i, result := range discovery.Results {
 			if result.Err != nil {
-				fmt.Fprintf(os.Stderr, "  tracker %d/%d: %s - %v\n", i+1, len(results), result.URL, result.Err)
+				fmt.Fprintf(os.Stderr, "  tracker %d/%d: %s - %v\n", i+1, len(discovery.Results), result.URL, result.Err)
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "  tracker %d/%d: %s - OK (%d peers)\n", i+1, len(results), result.URL, len(result.Peers))
+			fmt.Fprintf(os.Stderr, "  tracker %d/%d: %s - OK (%d peers, interval %s)\n",
+				i+1, len(discovery.Results), result.URL, len(result.Peers), result.Interval)
 		}
 	}
-	return peers, err
+	return discovery, err
 }
 
 // discoverPeerConnections performs a fast discovery pass and, when requested,
@@ -160,16 +162,29 @@ func run() error {
 	}
 
 	var (
-		peers         []tracker.Peer
-		connections   []*peer.PeerConnection
-		connectReport peer.ConnectReport
+		peers           []tracker.Peer
+		connections     []*peer.PeerConnection
+		connectReport   peer.ConnectReport
+		announceResults []tracker.AnnounceResult
 	)
 	if len(tf.AnnounceList) > 0 {
 		fmt.Fprintf(os.Stderr, "  primary: %s\n", tf.Announce)
+		announceEvent := tracker.EventStarted
 		peers, connections, connectReport, err = discoverPeerConnections(
 			len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
 			func(ctx context.Context) ([]tracker.Peer, error) {
-				return announceToTracker(ctx, tf.AnnounceList, tf.InfoHash, peerID, uint16(*port), tf.Length, false)
+				completed := m.CompletedBytes()
+				discovery, announceErr := announceToTracker(ctx, tf.AnnounceList, tracker.AnnounceRequest{
+					InfoHash:   tf.InfoHash,
+					PeerID:     peerID,
+					Port:       uint16(*port),
+					Downloaded: completed,
+					Left:       m.TotalLength() - completed,
+					Event:      announceEvent,
+				}, false)
+				announceEvent = tracker.EventNone
+				announceResults = session.MergeAnnounceResults(announceResults, discovery.Results)
+				return discovery.Peers, announceErr
 			},
 			func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
 				return peer.ConnectToPeersWithID(&tf, discovered, peerID)
@@ -187,11 +202,6 @@ func run() error {
 	}
 	fmt.Printf("Got %d peers from tracker\n", len(peers))
 
-	defer func() {
-		for _, conn := range connections {
-			conn.Close()
-		}
-	}()
 	fmt.Printf("Connected to %d peers\n", len(connections))
 	if len(connections) == 0 && len(peers) > 0 {
 		fmt.Fprintf(os.Stderr, "Peer connection summary: %d dialed, %d handshaken, %d usable\n",
@@ -203,6 +213,33 @@ func run() error {
 	}
 
 	m.SetPeers(connections)
+	defer closePeerConnections(m.Peers)
+
+	var cancelReannounce context.CancelFunc
+	var reannounceDone chan struct{}
+	if len(tf.AnnounceList) > 0 {
+		var reannounceCtx context.Context
+		reannounceCtx, cancelReannounce = context.WithCancel(context.Background())
+		reannounceDone = make(chan struct{})
+		go func() {
+			defer close(reannounceDone)
+			session.RunPeriodicReannounce(reannounceCtx, session.Config{
+				Torrent:        &tf,
+				PeerID:         peerID,
+				Port:           uint16(*port),
+				Manager:        m,
+				InitialPeers:   peers,
+				InitialResults: announceResults,
+				Announce: func(ctx context.Context, request tracker.AnnounceRequest) (tracker.DiscoveryResult, error) {
+					return announceToTracker(ctx, tf.AnnounceList, request, false)
+				},
+			})
+		}()
+		defer func() {
+			cancelReannounce()
+			<-reannounceDone
+		}()
+	}
 	fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
 		piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
 		float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
@@ -237,16 +274,29 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 
 	go func() {
 		var (
-			peers         []tracker.Peer
-			connections   []*peer.PeerConnection
-			connectReport peer.ConnectReport
-			announceErr   error
+			peers           []tracker.Peer
+			connections     []*peer.PeerConnection
+			connectReport   peer.ConnectReport
+			announceErr     error
+			announceResults []tracker.AnnounceResult
 		)
 		if len(tf.AnnounceList) > 0 {
+			announceEvent := tracker.EventStarted
 			peers, connections, connectReport, announceErr = discoverPeerConnections(
 				len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
 				func(ctx context.Context) ([]tracker.Peer, error) {
-					return announceToTracker(ctx, tf.AnnounceList, tf.InfoHash, peerID, port, tf.Length, true)
+					completed := m.CompletedBytes()
+					discovery, err := announceToTracker(ctx, tf.AnnounceList, tracker.AnnounceRequest{
+						InfoHash:   tf.InfoHash,
+						PeerID:     peerID,
+						Port:       port,
+						Downloaded: completed,
+						Left:       m.TotalLength() - completed,
+						Event:      announceEvent,
+					}, true)
+					announceEvent = tracker.EventNone
+					announceResults = session.MergeAnnounceResults(announceResults, discovery.Results)
+					return discovery.Peers, err
 				},
 				func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
 					return peer.ConnectToPeersWithID(tf, discovered, peerID)
@@ -265,12 +315,8 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 			return
 		}
 
-		defer func() {
-			for _, conn := range connections {
-				conn.Close()
-			}
-		}()
 		m.SetPeers(connections)
+		defer closePeerConnections(m.Peers)
 
 		if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 			m.SetStatus("No peers connected")
@@ -285,6 +331,32 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 			m.SetStatus(fmt.Sprintf("Downloading with %d peer(s)", len(connections)))
 		}
 
+		var cancelReannounce context.CancelFunc
+		var reannounceDone chan struct{}
+		if len(tf.AnnounceList) > 0 {
+			var reannounceCtx context.Context
+			reannounceCtx, cancelReannounce = context.WithCancel(context.Background())
+			reannounceDone = make(chan struct{})
+			go func() {
+				defer close(reannounceDone)
+				session.RunPeriodicReannounce(reannounceCtx, session.Config{
+					Torrent:        tf,
+					PeerID:         peerID,
+					Port:           port,
+					Manager:        m,
+					InitialPeers:   peers,
+					InitialResults: announceResults,
+					Announce: func(ctx context.Context, request tracker.AnnounceRequest) (tracker.DiscoveryResult, error) {
+						return announceToTracker(ctx, tf.AnnounceList, request, true)
+					},
+				})
+			}()
+			defer func() {
+				cancelReannounce()
+				<-reannounceDone
+			}()
+		}
+
 		err := m.Download(outputPath, true)
 		if err == nil {
 			piece.RemoveResume(statePath)
@@ -293,6 +365,12 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 	}()
 
 	return tui.Run(m, doneCh)
+}
+
+func closePeerConnections(peers func() []*peer.PeerConnection) {
+	for _, connection := range peers() {
+		connection.Close()
+	}
 }
 
 func main() {

@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -68,6 +69,12 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 // ConnectToPeersWithID connects to peers using the same peer ID that was sent
 // to the tracker and returns diagnostics for failed connection stages.
 func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
+	return ConnectToPeersWithContext(context.Background(), torrent, peers, localPeerID)
+}
+
+// ConnectToPeersWithContext cancels outstanding dials and handshakes when ctx
+// ends, which is required for periodic discovery shutdown.
+func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
 	var (
 		mu          sync.Mutex
 		connections []*PeerConnection
@@ -84,7 +91,8 @@ func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, lo
 		wg.Go(func() {
 			// TCP connect with timeout
 			addr := net.JoinHostPort(p.IP.String(), fmt.Sprintf("%d", p.Port))
-			conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+			dialer := net.Dialer{Timeout: 10 * time.Second}
+			conn, err := dialer.DialContext(ctx, "tcp", addr)
 			if err != nil {
 				recordFailure(addr, "dial", err)
 				return
@@ -94,10 +102,17 @@ func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, lo
 			mu.Unlock()
 
 			// BitTorrent handshake
+			stopCancel := context.AfterFunc(ctx, func() { conn.Close() })
 			remoteID, err := Handshake(conn, torrent.InfoHash, localPeerID)
+			cancelStopped := stopCancel()
 			if err != nil {
 				conn.Close()
 				recordFailure(addr, "handshake", err)
+				return
+			}
+			if !cancelStopped && ctx.Err() != nil {
+				conn.Close()
+				recordFailure(addr, "handshake", ctx.Err())
 				return
 			}
 			mu.Lock()
@@ -135,6 +150,10 @@ func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, lo
 				// No bitfield is valid; continue and learn availability from Have.
 			case <-pc.Done():
 				recordFailure(addr, "initial message", fmt.Errorf("connection closed"))
+				return
+			case <-ctx.Done():
+				pc.Close()
+				recordFailure(addr, "initial message", ctx.Err())
 				return
 			}
 
