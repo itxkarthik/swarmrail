@@ -3,7 +3,7 @@ package piece
 import (
 	"testing"
 
-	"go-torrent/internal/peer"
+	"github.com/itxkarthik/GoTorrent/internal/peer"
 )
 
 func makePeerWithBitfield(bitfield []bool) *peer.PeerConnection {

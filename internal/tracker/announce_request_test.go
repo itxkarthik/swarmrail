@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"go-torrent/internal/bencode"
+	"github.com/itxkarthik/GoTorrent/internal/bencode"
 )
 
 func TestDiscoverPreservesIntervalAndAnnounceState(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"go-torrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
 )
 
 // PieceWriter handles writing completed pieces to the output file(s).

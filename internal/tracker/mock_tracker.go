@@ -2,7 +2,7 @@ package tracker
 
 import (
 	"encoding/binary"
-	"go-torrent/internal/bencode"
+	"github.com/itxkarthik/GoTorrent/internal/bencode"
 	"net"
 	"net/http"
 	"net/http/httptest"

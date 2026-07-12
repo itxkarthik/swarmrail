@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"go-torrent/internal/peer"
-	"go-torrent/internal/torrent"
-	"go-torrent/internal/webseed"
+	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/webseed"
 )
 
 type fakeWebSeed struct {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"go-torrent/internal/piece"
+	"github.com/itxkarthik/GoTorrent/internal/piece"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/bubbles/progress"

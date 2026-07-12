@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"go-torrent/internal/peer"
-	"go-torrent/internal/piece"
-	"go-torrent/internal/torrent"
-	"go-torrent/internal/tracker"
+	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/GoTorrent/internal/piece"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/tracker"
 )
 
 func TestReannounceIntervalHonorsLongestTrackerInterval(t *testing.T) {

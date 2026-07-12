@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"go-torrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
 )
 
 func TestURLListSingleFileRange(t *testing.T) {

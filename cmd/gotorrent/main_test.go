@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"go-torrent/internal/peer"
-	"go-torrent/internal/tracker"
+	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/GoTorrent/internal/tracker"
 )
 
 func TestDiscoverPeerConnectionsRetriesAfterNoUsableConnections(t *testing.T) {

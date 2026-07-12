@@ -1,4 +1,4 @@
-module go-torrent
+module github.com/itxkarthik/GoTorrent
 
 go 1.25.6
 

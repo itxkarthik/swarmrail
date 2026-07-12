@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"go-torrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
 )
 
 const requestTimeout = 30 * time.Second

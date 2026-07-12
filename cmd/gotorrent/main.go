@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"go-torrent/internal/peer"
-	"go-torrent/internal/piece"
-	"go-torrent/internal/session"
-	"go-torrent/internal/torrent"
-	"go-torrent/internal/tracker"
-	"go-torrent/internal/tui"
+	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/GoTorrent/internal/piece"
+	"github.com/itxkarthik/GoTorrent/internal/session"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/tracker"
+	"github.com/itxkarthik/GoTorrent/internal/tui"
 )
 
 const (

@@ -3,7 +3,7 @@ package torrent
 import (
 	"fmt"
 
-	"go-torrent/internal/bencode"
+	"github.com/itxkarthik/GoTorrent/internal/bencode"
 )
 
 // FileEntry represents a single file in a multi-file torrent.

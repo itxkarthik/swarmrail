@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"go-torrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
 )
 
 func TestAnnounceHTTPWithTorrentFile(t *testing.T) {

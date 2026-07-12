@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"go-torrent/internal/torrent"
-	"go-torrent/internal/tracker"
+	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/GoTorrent/internal/tracker"
 )
 
 const peerIDPrefix = "-GT0001-"
