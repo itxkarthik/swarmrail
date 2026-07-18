@@ -17,6 +17,7 @@ func TestDiscoverPeerConnectionsRetriesAfterNoUsableConnections(t *testing.T) {
 	connectCalls := 0
 
 	peers, connections, report, err := discoverPeerConnections(
+		context.Background(),
 		true,
 		func(ctx context.Context) ([]tracker.Peer, error) {
 			announceCalls++
@@ -63,6 +64,7 @@ func TestDiscoverPeerConnectionsStopsAfterSuccessfulFirstPass(t *testing.T) {
 	announceCalls := 0
 	connectCalls := 0
 	_, connections, _, err := discoverPeerConnections(
+		context.Background(),
 		true,
 		func(context.Context) ([]tracker.Peer, error) {
 			announceCalls++
@@ -87,6 +89,7 @@ func TestDiscoverPeerConnectionsStopsAfterSuccessfulFirstPass(t *testing.T) {
 func TestDiscoverPeerConnectionsSkipsFallbackWhenWebseedAvailable(t *testing.T) {
 	announceCalls := 0
 	_, connections, _, _ := discoverPeerConnections(
+		context.Background(),
 		false,
 		func(context.Context) ([]tracker.Peer, error) {
 			announceCalls++

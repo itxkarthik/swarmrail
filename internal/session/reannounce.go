@@ -27,10 +27,19 @@ type Config struct {
 	InitialPeers   []tracker.Peer
 	InitialResults []tracker.AnnounceResult
 	Announce       AnnounceFunc
+	Controller     *ReannounceController
 }
 
 type periodicConnectFunc func([]tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport)
-type reannounceWaitFunc func(context.Context, time.Duration) bool
+type reannounceWake uint8
+
+const (
+	wakeStopped reannounceWake = iota
+	wakePeriodic
+	wakeManual
+)
+
+type reannounceWaitFunc func(context.Context, time.Duration, <-chan struct{}) reannounceWake
 
 func RunPeriodicReannounce(ctx context.Context, config Config) {
 	runPeriodicReannounceWith(
@@ -53,8 +62,16 @@ func runPeriodicReannounceWith(
 	interval := reannounceInterval(config.InitialResults)
 
 	for {
-		if !wait(ctx, interval) {
+		var requests <-chan struct{}
+		if config.Controller != nil {
+			requests = config.Controller.Requests()
+		}
+		wake := wait(ctx, interval, requests)
+		if wake == wakeStopped {
 			return
+		}
+		if config.Controller != nil && wake == wakePeriodic {
+			config.Controller.MarkAttempt()
 		}
 
 		completed := config.Manager.CompletedBytes()
@@ -71,6 +88,9 @@ func runPeriodicReannounceWith(
 		announceCtx, cancelAnnounce := context.WithTimeout(ctx, periodicAnnounceTimeout)
 		discovery, err := config.Announce(announceCtx, request)
 		cancelAnnounce()
+		if config.Controller != nil {
+			config.Controller.FinishAttempt()
+		}
 		if err != nil {
 			config.Manager.SetStatus(fmt.Sprintf("Tracker reannounce failed; retrying in %s", failedReannounceInterval))
 			interval = failedReannounceInterval
@@ -91,14 +111,16 @@ func runPeriodicReannounceWith(
 	}
 }
 
-func waitForReannounce(ctx context.Context, interval time.Duration) bool {
+func waitForReannounce(ctx context.Context, interval time.Duration, requests <-chan struct{}) reannounceWake {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return true
+		return wakePeriodic
+	case <-requests:
+		return wakeManual
 	case <-ctx.Done():
-		return false
+		return wakeStopped
 	}
 }
 

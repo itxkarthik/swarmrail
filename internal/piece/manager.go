@@ -32,6 +32,19 @@ type PieceResult struct {
 	Err   error
 }
 
+type SourceKind string
+
+const (
+	SourcePeer    SourceKind = "peer"
+	SourceWebSeed SourceKind = "webseed"
+)
+
+type SourceSnapshot struct {
+	Kind     SourceKind
+	Endpoint string
+	State    string
+}
+
 // Manager orchestrates piece downloading across multiple peers.
 type Manager struct {
 	totalPieces  int
@@ -96,7 +109,17 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 // progress periodically during the download.
 //
 // Blocks until all pieces are downloaded or an error occurs.
-func (m *Manager) Download(outputPath string, resume bool) error {
+func (m *Manager) Download(parent context.Context, outputPath string, resume bool) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	defer func() {
+		if m.savePath != "" && !m.allCompleted() {
+			if err := SaveResume(m.savePath, m.infoHash, m.Completed()); err != nil && m.logWriter != nil {
+				fmt.Fprintf(m.logWriter, "\nWarning: failed to save resume state: %v\n", err)
+			}
+		}
+	}()
 	if len(m.peers) == 0 && len(m.webseeds) == 0 {
 		return fmt.Errorf("no peers or webseeds available")
 	}
@@ -121,7 +144,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 	if err != nil {
 		return fmt.Errorf("creating piece writer: %w", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	m.mu.Lock()
 	m.pw = pw
 	m.downloadCtx = ctx
@@ -611,6 +634,28 @@ func (m *Manager) TotalLength() uint64 { return m.totalLength }
 
 // WebSeedCount returns the number of configured HTTP sources.
 func (m *Manager) WebSeedCount() int { return len(m.webseeds) }
+
+// SourceSnapshots returns a stable, thread-safe view of every active peer and
+// configured webseed for terminal and diagnostic interfaces.
+func (m *Manager) SourceSnapshots() []SourceSnapshot {
+	m.mu.Lock()
+	peers := append([]*peer.PeerConnection(nil), m.peers...)
+	webseeds := append([]webseed.Source(nil), m.webseeds...)
+	m.mu.Unlock()
+
+	out := make([]SourceSnapshot, 0, len(peers)+len(webseeds))
+	for _, connection := range peers {
+		if connection == nil {
+			continue
+		}
+		out = append(out, SourceSnapshot{Kind: SourcePeer, Endpoint: connection.RemoteAddr(), State: "active"})
+	}
+	for _, source := range webseeds {
+		snapshot := source.Snapshot()
+		out = append(out, SourceSnapshot{Kind: SourceWebSeed, Endpoint: snapshot.Name, State: string(snapshot.State)})
+	}
+	return out
+}
 
 // CompletedBytes returns the exact number of verified bytes represented by the
 // completed bitfield. The final piece may be shorter than pieceLength.

@@ -2,11 +2,7 @@ package tracker
 
 import (
 	"encoding/hex"
-	"errors"
-	"fmt"
-	"net"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/itxkarthik/GoTorrent/internal/torrent"
@@ -33,51 +29,15 @@ func TestAnnounceHTTPWithTorrentFile(t *testing.T) {
 	var peerID [20]byte
 	copy(peerID[:], peerIDBytes)
 
-	trackers := []string{
-		"http://tracker.opentrackr.org:1337/announce",
-		"http://tracker.openbittorrent.com:80/announce",
-		"http://tracker.publicbt.com:80/announce",
+	mock := NewMockTrackerServer(t)
+	peers, err := AnnounceHTTP(mock.URL, tf.InfoHash, peerID, 6881, tf.Length)
+	if err != nil {
+		t.Fatalf("announce failed: %v", err)
 	}
-	if trackerOverride := os.Getenv("TRACKER_URL"); trackerOverride != "" {
-		trackers = []string{trackerOverride}
+	if len(peers) != len(mock.Peers) {
+		t.Fatalf("peers = %d, want %d", len(peers), len(mock.Peers))
 	}
-
-	var lastErr error
-	for _, trackerURL := range trackers {
-		peers, err := AnnounceHTTP(trackerURL, tf.InfoHash, peerID, 6881, tf.Length)
-		if err != nil {
-			if isNetworkError(err) || isUnavailableTrackerResponse(err) {
-				lastErr = err
-				continue
-			}
-			t.Fatalf("announce failed: %v", err)
-		}
-		if len(peers) == 0 {
-			lastErr = fmt.Errorf("expected peers, got none from %s", trackerURL)
-			continue
-		}
-		return
+	if mock.LastInfoHash != tf.InfoHash || mock.LastPeerID != peerID || mock.LastPort != 6881 {
+		t.Fatalf("tracker request mismatch: hash=%x peerID=%x port=%d", mock.LastInfoHash, mock.LastPeerID, mock.LastPort)
 	}
-
-	if lastErr != nil {
-		t.Skipf("no reachable tracker: %v", lastErr)
-	}
-	t.Skip("no trackers configured")
-}
-
-func isNetworkError(err error) bool {
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout()
-	}
-	return false
-}
-
-func isUnavailableTrackerResponse(err error) bool {
-	return strings.Contains(err.Error(), "unknown type: <") ||
-		strings.Contains(err.Error(), "tracker returned HTTP")
 }

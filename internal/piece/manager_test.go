@@ -28,6 +28,9 @@ func (f *fakeWebSeed) FetchPiece(ctx context.Context, index uint32, length int64
 }
 func (f *fakeWebSeed) Disable()        {}
 func (f *fakeWebSeed) Available() bool { return true }
+func (f *fakeWebSeed) Snapshot() webseed.Snapshot {
+	return webseed.Snapshot{Name: f.Name(), State: webseed.StateReady}
+}
 
 // VerifyPiece Tests
 
@@ -99,7 +102,7 @@ func TestDownloadWebSeedOnly(t *testing.T) {
 	m.SetLogWriter(io.Discard)
 
 	dir := t.TempDir()
-	if err := m.Download(dir, true); err != nil {
+	if err := m.Download(context.Background(), dir, true); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "out.bin"))
@@ -127,7 +130,7 @@ func TestDownloadAcceptsPeerAddedAtRuntime(t *testing.T) {
 	m.SetLogWriter(io.Discard)
 	dir := t.TempDir()
 	done := make(chan error, 1)
-	go func() { done <- m.Download(dir, true) }()
+	go func() { done <- m.Download(context.Background(), dir, true) }()
 
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -165,6 +168,56 @@ func TestDownloadAcceptsPeerAddedAtRuntime(t *testing.T) {
 	}
 	if string(written) != string(data) {
 		t.Fatalf("downloaded data = %q, want %q", written, data)
+	}
+}
+
+func TestDownloadCancellationPersistsResumeState(t *testing.T) {
+	tf := &torrent.TorrentFile{
+		Name: "cancel.bin", Length: 4, PieceLength: 4,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("data"))},
+		InfoHash:    [20]byte{1, 2, 3},
+	}
+	dormant, closeDormant := newServingPeer(t, []bool{false}, nil)
+	defer closeDormant()
+	m := NewManager(tf, []*peer.PeerConnection{dormant})
+	m.SetLogWriter(io.Discard)
+	dir := t.TempDir()
+	statePath := StateFilePath(dir, tf.Name, tf.InfoHash)
+	m.EnablePeriodicSave(statePath, tf.InfoHash)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Download(ctx, dir, true) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Download() error = %v, want context.Canceled", err)
+	}
+	state, err := LoadResume(statePath, tf.InfoHash)
+	if err != nil {
+		t.Fatalf("resume state not saved on cancellation: %v", err)
+	}
+	if len(state.Completed) != 1 || state.Completed[0] {
+		t.Fatalf("saved completion = %v, want [false]", state.Completed)
+	}
+}
+
+func TestSourceSnapshotsIncludesWebseedsAndPeers(t *testing.T) {
+	connection, closeConnection := newServingPeer(t, []bool{false}, nil)
+	defer closeConnection()
+	m := &Manager{
+		peers:    []*peer.PeerConnection{connection},
+		webseeds: []webseed.Source{&fakeWebSeed{}},
+	}
+	snapshots := m.SourceSnapshots()
+	if len(snapshots) != 2 {
+		t.Fatalf("SourceSnapshots() count = %d, want 2", len(snapshots))
+	}
+	if snapshots[0].Kind != SourcePeer || snapshots[0].State != "active" {
+		t.Fatalf("peer snapshot = %+v", snapshots[0])
+	}
+	if snapshots[1].Kind != SourceWebSeed || snapshots[1].Endpoint != "fake" || snapshots[1].State != "ready" {
+		t.Fatalf("webseed snapshot = %+v", snapshots[1])
 	}
 }
 

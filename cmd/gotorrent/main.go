@@ -47,13 +47,14 @@ func announceToTracker(ctx context.Context, announceURLs []string, request track
 // discoverPeerConnections performs a fast discovery pass and, when requested,
 // one slower fallback pass if none of the first peers can be connected.
 func discoverPeerConnections(
+	parent context.Context,
 	allowFallback bool,
 	announce announcePeersFunc,
 	connect connectPeersFunc,
 	setStatus func(string),
 ) ([]tracker.Peer, []*peer.PeerConnection, peer.ConnectReport, error) {
 	announceAttempt := func(timeout time.Duration) ([]tracker.Peer, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 		return announce(ctx)
 	}
@@ -116,6 +117,8 @@ func run() error {
 	output := flag.String("output", "", "output directory (default: torrent name)")
 	tuiMode := flag.Bool("tui", false, "terminal UI mode")
 	flag.Parse()
+	ctx, stop := signalNotifyContext(context.Background())
+	defer stop()
 
 	if flag.NArg() < 1 {
 		return fmt.Errorf("Usage: gotorrent [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
@@ -142,13 +145,16 @@ func run() error {
 	}
 
 	m := piece.NewManager(&tf, nil)
-	statePath := piece.StateFilePath(outputPath, tf.Name)
+	statePath := piece.StateFilePath(outputPath, tf.Name, tf.InfoHash)
 
-	// Try to resume from saved state
-	if state, err := piece.LoadResume(statePath, tf.InfoHash); err == nil {
+	// Resume only from pieces that still match the payload on disk.
+	if state, report, err := piece.LoadVerifiedResume(outputPath, &tf); err == nil {
 		completed := piece.CountCompleted(state.Completed)
 		if !*tuiMode {
 			fmt.Printf("Resuming from %d/%d completed pieces\n", completed, len(tf.PieceHashes))
+			if report.ResetPieces > 0 {
+				fmt.Printf("Reset %d stale resume piece(s) for redownload\n", report.ResetPieces)
+			}
 		}
 		m.SetCompleted(state.Completed)
 	} else if !os.IsNotExist(err) && !*tuiMode {
@@ -158,7 +164,7 @@ func run() error {
 	m.EnablePeriodicSave(statePath, tf.InfoHash)
 
 	if *tuiMode {
-		return runTUIFlow(m, statePath, outputPath, &tf, peerID, uint16(*port))
+		return runTUIFlow(ctx, m, statePath, outputPath, &tf, peerID, uint16(*port))
 	}
 
 	var (
@@ -171,6 +177,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "  primary: %s\n", tf.Announce)
 		announceEvent := tracker.EventStarted
 		peers, connections, connectReport, err = discoverPeerConnections(
+			ctx,
 			len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
 			func(ctx context.Context) ([]tracker.Peer, error) {
 				completed := m.CompletedBytes()
@@ -219,7 +226,7 @@ func run() error {
 	var reannounceDone chan struct{}
 	if len(tf.AnnounceList) > 0 {
 		var reannounceCtx context.Context
-		reannounceCtx, cancelReannounce = context.WithCancel(context.Background())
+		reannounceCtx, cancelReannounce = context.WithCancel(ctx)
 		reannounceDone = make(chan struct{})
 		go func() {
 			defer close(reannounceDone)
@@ -244,21 +251,7 @@ func run() error {
 		piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
 		float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
 
-	// Signal handler for graceful shutdown (CLI mode only)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\nSaving state and exiting...")
-		if err := piece.SaveResume(statePath, tf.InfoHash, m.Completed()); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving resume state: %v\n", err)
-		} else {
-			fmt.Printf("Resume state saved to %s\n", statePath)
-		}
-		os.Exit(0)
-	}()
-
-	if err := m.Download(outputPath, true); err != nil {
+	if err := m.Download(ctx, outputPath, true); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
@@ -267,9 +260,16 @@ func run() error {
 	return nil
 }
 
-func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.TorrentFile, peerID [20]byte, port uint16) error {
+func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath string, tf *torrent.TorrentFile, peerID [20]byte, port uint16) error {
 	m.SetLogWriter(io.Discard) // suppress stderr progress in TUI mode
 	doneCh := make(chan error, 1)
+	workerResult := make(chan error, 1)
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var controller *session.ReannounceController
+	if len(tf.AnnounceList) > 0 {
+		controller = session.NewReannounceController(time.Minute)
+	}
 	m.SetStatus("Connecting trackers...")
 
 	go func() {
@@ -283,8 +283,11 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 		if len(tf.AnnounceList) > 0 {
 			announceEvent := tracker.EventStarted
 			peers, connections, connectReport, announceErr = discoverPeerConnections(
+				ctx,
 				len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
 				func(ctx context.Context) ([]tracker.Peer, error) {
+					controller.MarkAttempt()
+					defer controller.FinishAttempt()
 					completed := m.CompletedBytes()
 					discovery, err := announceToTracker(ctx, tf.AnnounceList, tracker.AnnounceRequest{
 						InfoHash:   tf.InfoHash,
@@ -308,9 +311,13 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 		if len(peers) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 			m.SetStatus("No peers or webseeds available")
 			if announceErr != nil {
-				doneCh <- fmt.Errorf("tracker discovery failed after fallback: %w", announceErr)
+				err := fmt.Errorf("tracker discovery failed after fallback: %w", announceErr)
+				doneCh <- err
+				workerResult <- err
 			} else {
-				doneCh <- fmt.Errorf("no peers or webseeds available after tracker fallback")
+				err := fmt.Errorf("no peers or webseeds available after tracker fallback")
+				doneCh <- err
+				workerResult <- err
 			}
 			return
 		}
@@ -320,8 +327,10 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 
 		if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 			m.SetStatus("No peers connected")
-			doneCh <- fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
+			err := fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
 				len(peers), connectReport.Dialed, connectReport.Handshaken)
+			doneCh <- err
+			workerResult <- err
 			return
 		}
 
@@ -335,7 +344,7 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 		var reannounceDone chan struct{}
 		if len(tf.AnnounceList) > 0 {
 			var reannounceCtx context.Context
-			reannounceCtx, cancelReannounce = context.WithCancel(context.Background())
+			reannounceCtx, cancelReannounce = context.WithCancel(ctx)
 			reannounceDone = make(chan struct{})
 			go func() {
 				defer close(reannounceDone)
@@ -349,6 +358,7 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 					Announce: func(ctx context.Context, request tracker.AnnounceRequest) (tracker.DiscoveryResult, error) {
 						return announceToTracker(ctx, tf.AnnounceList, request, true)
 					},
+					Controller: controller,
 				})
 			}()
 			defer func() {
@@ -357,14 +367,28 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 			}()
 		}
 
-		err := m.Download(outputPath, true)
+		err := m.Download(ctx, outputPath, true)
 		if err == nil {
 			piece.RemoveResume(statePath)
 		}
 		doneCh <- err
+		workerResult <- err
 	}()
 
-	return tui.Run(m, doneCh)
+	tuiErr := tui.Run(m, doneCh, controller, cancel)
+	cancel()
+	workerErr := <-workerResult
+	if tuiErr != nil {
+		return tuiErr
+	}
+	if workerErr != nil && !errors.Is(workerErr, context.Canceled) {
+		return workerErr
+	}
+	return nil
+}
+
+var signalNotifyContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 }
 
 func closePeerConnections(peers func() []*peer.PeerConnection) {

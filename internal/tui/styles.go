@@ -1,6 +1,6 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import "charm.land/lipgloss/v2"
 
 // Colours
 var (
@@ -42,9 +42,7 @@ var (
 
 	// Stats
 	StatLabel = lipgloss.NewStyle().
-			Foreground(grayLight).
-			Width(12).
-			Align(lipgloss.Right)
+			Foreground(grayLight)
 
 	StatValue = lipgloss.NewStyle().
 			Foreground(white).

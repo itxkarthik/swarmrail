@@ -66,23 +66,92 @@ func TestPeriodicReannounceAddsOnlyNewPeersAndUsesCurrentProgress(t *testing.T) 
 			}
 			return []*peer.PeerConnection{}, peer.ConnectReport{Attempted: 1}
 		},
-		func(_ context.Context, interval time.Duration) bool {
+		func(_ context.Context, interval time.Duration, _ <-chan struct{}) reannounceWake {
 			waits++
 			if waits == 1 {
 				if interval != time.Minute {
 					t.Fatalf("first interval = %s, want 1m", interval)
 				}
-				return true
+				return wakePeriodic
 			}
 			if interval != 2*time.Minute {
 				t.Fatalf("next interval = %s, want 2m", interval)
 			}
 			cancel()
-			return false
+			return wakeStopped
 		},
 	)
 
 	if announceCalls != 1 || connectCalls != 1 {
 		t.Fatalf("announce calls = %d, connect calls = %d; want 1, 1", announceCalls, connectCalls)
+	}
+}
+
+func TestManualReannounceWakesPeriodicLoopImmediately(t *testing.T) {
+	tf := &torrent.TorrentFile{Name: "test", Length: 100, PieceLength: 100, PieceHashes: make([][20]byte, 1)}
+	m := piece.NewManager(tf, nil)
+	controller := NewReannounceController(time.Minute)
+	announceCalls := 0
+	waits := 0
+	ctx := context.Background()
+	runPeriodicReannounceWith(ctx, Config{
+		Torrent: tf, Manager: m, Controller: controller,
+		InitialResults: []tracker.AnnounceResult{{URL: "udp://tracker", Interval: time.Hour}},
+		Announce: func(context.Context, tracker.AnnounceRequest) (tracker.DiscoveryResult, error) {
+			announceCalls++
+			return tracker.DiscoveryResult{}, nil
+		},
+	}, func([]tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
+		return nil, peer.ConnectReport{}
+	}, func(_ context.Context, interval time.Duration, requests <-chan struct{}) reannounceWake {
+		waits++
+		if waits == 1 {
+			if interval != time.Hour || requests == nil {
+				t.Fatalf("wait interval=%s requests=%v, want 1h and manual channel", interval, requests)
+			}
+			return wakeManual
+		}
+		return wakeStopped
+	})
+	if announceCalls != 1 {
+		t.Fatalf("manual announce calls = %d, want 1", announceCalls)
+	}
+}
+
+func TestReannounceControllerEnforcesCooldown(t *testing.T) {
+	now := time.Unix(100, 0)
+	controller := NewReannounceController(time.Minute)
+	controller.now = func() time.Time { return now }
+	controller.MarkAttempt()
+	controller.FinishAttempt()
+
+	result := controller.Request()
+	if result.Accepted || result.RetryAfter != time.Minute {
+		t.Fatalf("Request() = %+v, want rejected with 1m retry", result)
+	}
+	now = now.Add(61 * time.Second)
+	result = controller.Request()
+	if !result.Accepted || result.RetryAfter != 0 {
+		t.Fatalf("Request() = %+v, want accepted", result)
+	}
+	select {
+	case <-controller.Requests():
+	default:
+		t.Fatal("accepted request was not queued")
+	}
+}
+
+func TestReannounceControllerRejectsWhileAttemptActive(t *testing.T) {
+	controller := NewReannounceController(0)
+	if result := controller.Request(); !result.Accepted {
+		t.Fatalf("first Request() = %+v, want accepted", result)
+	}
+	if result := controller.Request(); result.Accepted {
+		t.Fatalf("second Request() = %+v, want rejected while active", result)
+	}
+	<-controller.Requests()
+	controller.FinishAttempt()
+	if result := controller.Request(); !result.Accepted {
+		t.Fatalf("Request() after FinishAttempt = %+v, want accepted", result)
 	}
 }

@@ -23,6 +23,21 @@ type Source interface {
 	FetchPiece(ctx context.Context, index uint32, length int64) ([]byte, error)
 	Disable()
 	Available() bool
+	Snapshot() Snapshot
+}
+
+type State string
+
+const (
+	StateReady    State = "ready"
+	StateFetching State = "fetching"
+	StateBackoff  State = "backoff"
+	StateDisabled State = "disabled"
+)
+
+type Snapshot struct {
+	Name  string
+	State State
 }
 
 type baseSource struct {
@@ -30,6 +45,7 @@ type baseSource struct {
 	client       *http.Client
 	disabled     bool
 	backoffUntil time.Time
+	active       int
 	mu           sync.Mutex
 }
 
@@ -56,6 +72,21 @@ func (s *baseSource) Available() bool {
 	return !s.disabled && time.Now().After(s.backoffUntil)
 }
 
+func (s *baseSource) Snapshot() Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := StateReady
+	switch {
+	case s.disabled:
+		state = StateDisabled
+	case s.active > 0:
+		state = StateFetching
+	case time.Now().Before(s.backoffUntil):
+		state = StateBackoff
+	}
+	return Snapshot{Name: s.name, State: state}
+}
+
 func (s *baseSource) backoff(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,6 +97,14 @@ func (s *baseSource) do(req *http.Request, want int64) ([]byte, error) {
 	if !s.Available() {
 		return nil, ErrUnavailable
 	}
+	s.mu.Lock()
+	s.active++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+	}()
 
 	resp, err := s.client.Do(req)
 	if err != nil {

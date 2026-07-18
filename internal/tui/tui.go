@@ -1,22 +1,25 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/itxkarthik/GoTorrent/internal/piece"
+	"github.com/itxkarthik/GoTorrent/internal/session"
 
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
-// TickMsg fires periodically to refresh stats.
 type TickMsg struct{}
-
-// DownloadDoneMsg signals the download finished.
 type DownloadDoneMsg struct{ Err error }
 
 type transferSample struct {
@@ -24,55 +27,77 @@ type transferSample struct {
 	bytes uint64
 }
 
-// Model is the Bubble Tea model for the GoTorrent TUI.
-type Model struct {
-	m        *piece.Manager
-	width    int
-	height   int
-	ready    bool
-	percent  float64 // 0.0 – 1.0, set every tick
-	progress progress.Model
-	done     bool
-	err      error
-	doneCh   <-chan error // closed when download completes
-
-	// Speed tracking
-	transferSamples []transferSample
-	downloadRate    float64 // bytes/sec
-
-	// Piece map cache
-	pieceMapWidth int
+type keyMap struct {
+	Reannounce key.Binding
+	Quit       key.Binding
 }
 
-// NewModel creates a new TUI model.
-func NewModel(m *piece.Manager, doneCh <-chan error) Model {
-	return Model{
-		m:               m,
-		doneCh:          doneCh,
-		transferSamples: []transferSample{{at: time.Now(), bytes: m.TransferredBytes()}},
-		pieceMapWidth:   60,
-		progress:        progress.New(progress.WithSolidFill("#22C55E"), progress.WithoutPercentage()),
+func defaultKeyMap() keyMap {
+	return keyMap{
+		Reannounce: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "reannounce")),
+		Quit:       key.NewBinding(key.WithKeys("q", "esc", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
-// Init initializes the program with a tick command for periodic updates
-// and a wait-for-done command.
+func (k keyMap) ShortHelp() []key.Binding  { return []key.Binding{k.Reannounce, k.Quit} }
+func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{{k.Reannounce, k.Quit}} }
+
+type Model struct {
+	m                *piece.Manager
+	width            int
+	height           int
+	ready            bool
+	percent          float64
+	progress         progress.Model
+	spinner          spinner.Model
+	sources          table.Model
+	help             help.Model
+	keys             keyMap
+	done             bool
+	err              error
+	doneCh           <-chan error
+	reannounce       *session.ReannounceController
+	cancel           context.CancelFunc
+	localStatus      string
+	localStatusUntil time.Time
+	pieceMapWidth    int
+
+	transferSamples []transferSample
+	downloadRate    float64
+}
+
+func NewModel(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc) Model {
+	progressModel := progress.New(progress.WithColors(green), progress.WithoutPercentage())
+	spinnerModel := spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(lipgloss.NewStyle().Foreground(indigo)))
+	tableStyles := table.DefaultStyles()
+	tableStyles.Header = tableStyles.Header.Foreground(indigo).Bold(true)
+	tableStyles.Cell = tableStyles.Cell.Foreground(white)
+	tableStyles.Selected = tableStyles.Selected.Foreground(green).Bold(true)
+	sources := table.New(table.WithFocused(true), table.WithHeight(6), table.WithStyles(tableStyles))
+	helpModel := help.New()
+	helpModel.Styles = help.DefaultDarkStyles()
+	model := Model{
+		m: m, doneCh: doneCh, reannounce: reannounce, cancel: cancel,
+		progress: progressModel, spinner: spinnerModel, sources: sources,
+		help: helpModel, keys: defaultKeyMap(), pieceMapWidth: 60,
+		transferSamples: []transferSample{{at: time.Now(), bytes: m.TransferredBytes()}},
+	}
+	model.refreshSources(60)
+	return model
+}
+
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.tickCmd(),
-		m.waitForDone(),
-	)
+	cmds := []tea.Cmd{m.tickCmd(), m.spinner.Tick}
+	if m.doneCh != nil {
+		cmds = append(cmds, m.waitForDone())
+	}
+	return tea.Batch(cmds...)
 }
 
-// tickCmd returns a command that fires a TickMsg after the refresh interval.
-// It is re-scheduled from the TickMsg handler so the TUI updates continuously.
 func (m Model) tickCmd() tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
-		return TickMsg{}
-	})
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg { return TickMsg{} })
 }
 
-// waitForDone returns a Cmd that blocks until the download finishes.
 func (m Model) waitForDone() tea.Cmd {
 	return func() tea.Msg {
 		err, ok := <-m.doneCh
@@ -83,69 +108,112 @@ func (m Model) waitForDone() tea.Cmd {
 	}
 }
 
-// Update handles messages and returns the updated model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.ready = true
-		m.pieceMapWidth = msg.Width - 10
-		if m.pieceMapWidth < 20 {
-			m.pieceMapWidth = 20
-		}
-		m.progress.Width = msg.Width - 14
-		if m.progress.Width < 10 {
-			m.progress.Width = 10
-		}
+		m.width, m.height, m.ready = msg.Width, msg.Height, true
+		m.resizeComponents()
 		return m, nil
-
 	case TickMsg:
-		if m.done || m.err != nil {
-			return m, nil
+		if !m.done {
+			if !m.localStatusUntil.IsZero() && time.Now().After(m.localStatusUntil) {
+				m.localStatus = ""
+				m.localStatusUntil = time.Time{}
+			}
+			m.updateStats()
+			m.refreshSources(m.sources.Width())
+			cmds = append(cmds, m.tickCmd())
 		}
-		m.updateStats()
-		return m, m.tickCmd()
-
 	case DownloadDoneMsg:
-		m.done = true
-		if msg.Err != nil {
-			m.err = msg.Err
-		}
-		// Don't quit immediately on error — wait for user keypress
-		return m, nil
-
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c", "esc":
+		m.done, m.err = true, msg.Err
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
+	case tea.KeyPressMsg:
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			if m.cancel != nil {
+				m.cancel()
+			}
 			return m, tea.Quit
+		case key.Matches(msg, m.keys.Reannounce):
+			if m.reannounce == nil {
+				m.localStatus = "No trackers available for reannounce"
+			} else {
+				result := m.reannounce.Request()
+				if result.Accepted {
+					m.localStatus = "Manual reannounce queued"
+				} else if result.RetryAfter > 0 {
+					m.localStatus = fmt.Sprintf("Reannounce available in %s", result.RetryAfter.Round(time.Second))
+				} else {
+					m.localStatus = "Reannounce already in progress"
+				}
+			}
+			m.localStatusUntil = time.Now().Add(3 * time.Second)
 		}
-		return m, nil
 	}
 
-	return m, nil
+	var tableCmd tea.Cmd
+	m.sources, tableCmd = m.sources.Update(msg)
+	cmds = append(cmds, tableCmd)
+	return m, tea.Batch(cmds...)
 }
 
-// updateStats reads the manager's current state and updates the model.
+func (m *Model) resizeComponents() {
+	inner := max(20, m.width-6)
+	if m.width < 70 {
+		inner = max(20, m.width-2)
+	}
+	m.progress.SetWidth(max(10, inner-8))
+	m.help.SetWidth(inner)
+	m.pieceMapWidth = inner
+	sourceWidth := inner
+	if m.width >= 100 && m.height >= 22 {
+		sourceWidth = max(36, inner*45/100)
+		m.pieceMapWidth = max(30, inner-sourceWidth-3)
+	}
+	height := 6
+	if m.height < 18 {
+		height = 4
+	} else if m.width >= 100 {
+		height = min(10, max(6, m.height-12))
+	}
+	m.sources.SetWidth(sourceWidth)
+	m.sources.SetHeight(height)
+	m.refreshSources(sourceWidth)
+}
+
+func (m *Model) refreshSources(width int) {
+	if width <= 0 {
+		width = 60
+	}
+	kindWidth, stateWidth := 9, 10
+	endpointWidth := max(10, width-kindWidth-stateWidth-6)
+	if width < 50 {
+		kindWidth, stateWidth = 8, 9
+		endpointWidth = max(8, width-kindWidth-stateWidth-6)
+	}
+	m.sources.SetColumns([]table.Column{{Title: "Type", Width: kindWidth}, {Title: "Endpoint", Width: endpointWidth}, {Title: "State", Width: stateWidth}})
+	rows := make([]table.Row, 0)
+	for _, source := range m.m.SourceSnapshots() {
+		rows = append(rows, table.Row{string(source.Kind), source.Endpoint, source.State})
+	}
+	if len(rows) == 0 {
+		rows = append(rows, table.Row{"—", "Waiting for sources", "idle"})
+	}
+	m.sources.SetRows(rows)
+}
+
 func (m *Model) updateStats() {
 	now := time.Now()
-	m.transferSamples = append(m.transferSamples, transferSample{
-		at:    now,
-		bytes: m.m.TransferredBytes(),
-	})
+	m.transferSamples = append(m.transferSamples, transferSample{at: now, bytes: m.m.TransferredBytes()})
 	m.updateDownloadRate(now, 3*time.Second)
-
-	// Progress is based on exact verified bytes, including a short final piece.
-	totalLength := m.m.TotalLength()
-	if totalLength > 0 {
-		m.percent = float64(m.m.CompletedBytes()) / float64(totalLength)
+	if total := m.m.TotalLength(); total > 0 {
+		m.percent = float64(m.m.CompletedBytes()) / float64(total)
 	}
-	if m.percent < 0 {
-		m.percent = 0
-	}
-	if m.percent > 1 {
-		m.percent = 1
-	}
+	m.percent = max(0, min(1, m.percent))
 }
 
 func (m *Model) updateDownloadRate(now time.Time, window time.Duration) {
@@ -155,9 +223,7 @@ func (m *Model) updateDownloadRate(now time.Time, window time.Duration) {
 		first++
 	}
 	m.transferSamples = m.transferSamples[first:]
-
-	oldest := m.transferSamples[0]
-	latest := m.transferSamples[len(m.transferSamples)-1]
+	oldest, latest := m.transferSamples[0], m.transferSamples[len(m.transferSamples)-1]
 	elapsed := latest.at.Sub(oldest.at).Seconds()
 	if elapsed <= 0 || latest.bytes < oldest.bytes {
 		m.downloadRate = 0
@@ -166,237 +232,107 @@ func (m *Model) updateDownloadRate(now time.Time, window time.Duration) {
 	m.downloadRate = float64(latest.bytes-oldest.bytes) / elapsed
 }
 
-// View renders the terminal UI.
 func (m Model) View() tea.View {
 	if !m.ready {
-		status := m.m.Status()
-		if status == "" {
-			status = "Initialising..."
-		}
-		return tea.NewView(status)
+		return tea.NewView(m.status())
 	}
-
 	if m.err != nil {
-		return tea.NewView(ErrorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
+		return tea.NewView(m.wrap(ErrorStyle.Render(fmt.Sprintf("Download failed: %v\n\nPress q to exit", m.err))))
 	}
-
 	if m.done {
-		return tea.NewView(m.renderComplete())
+		return tea.NewView(m.wrap(lipgloss.NewStyle().Foreground(green).Bold(true).Render("Download complete") + "\n\nPress q to exit"))
 	}
-
 	return tea.NewView(m.renderMain())
 }
 
-// renderMain renders the main TUI layout during download.
 func (m Model) renderMain() string {
-	var out strings.Builder
-
-	// Header
-	out.WriteString(m.renderHeader())
-	out.WriteString("\n")
-
-	// Progress bar
-	out.WriteString(m.renderProgress())
-	out.WriteString("\n")
-
-	// Stats row
-	out.WriteString(m.renderStats())
-	out.WriteString("\n")
-
-	// Piece map
-	out.WriteString(m.renderPieceMap())
-	out.WriteString("\n\n")
-
-	// Peer table
-	out.WriteString(m.renderPeerTable())
-	out.WriteString("\n")
-
-	// Status bar
-	out.WriteString(m.renderStatusBar())
-
-	return AppStyle.Render(out.String())
-}
-
-// renderComplete shows a completion screen.
-func (m Model) renderComplete() string {
-	var out strings.Builder
-	if m.err != nil {
-		out.WriteString(ErrorStyle.Render(fmt.Sprintf("Download failed: %v\n", m.err)))
+	innerWidth := max(20, m.width-6)
+	if m.width < 70 {
+		innerWidth = max(20, m.width-2)
+	}
+	header := lipgloss.NewStyle().Foreground(white).Bold(true).MaxWidth(innerWidth).Render("GoTorrent  " + m.m.TorrentName())
+	status := lipgloss.NewStyle().Foreground(grayLight).MaxWidth(max(10, innerWidth-3)).Render(m.status())
+	progressLine := m.progress.ViewAs(m.percent) + fmt.Sprintf(" %5.1f%%", m.percent*100)
+	stats := m.renderStats(m.width < 70, innerWidth)
+	sources := SectionStyle.Render("Sources") + "\n" + m.sources.View()
+	parts := []string{header, m.spinner.View() + " " + status, progressLine, stats}
+	if m.width >= 100 && m.height >= 22 {
+		piecePanel := lipgloss.NewStyle().Width(m.pieceMapWidth).Render(m.renderPieceMap())
+		sourcePanel := lipgloss.NewStyle().Width(m.sources.Width()).Render(sources)
+		parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top, piecePanel, "   ", sourcePanel))
 	} else {
-		out.WriteString(lipgloss.NewStyle().Foreground(green).Bold(true).Render("Download Complete\n\n"))
+		if m.width >= 70 && m.height >= 18 {
+			parts = append(parts, m.renderPieceMap())
+		}
+		parts = append(parts, sources)
 	}
-	out.WriteString("Press q to exit")
-	return AppStyle.Render(out.String())
+	parts = append(parts, m.help.View(m.keys))
+	return m.wrap(strings.Join(parts, "\n"))
 }
 
-// renderHeader renders the torrent name header.
-func (m Model) renderHeader() string {
-	name := m.m.TorrentName()
-	if len(name) > 60 {
-		name = name[:57] + "..."
+func (m Model) wrap(content string) string {
+	if m.width < 70 || m.height < 18 {
+		return lipgloss.NewStyle().MaxWidth(max(1, m.width)).Padding(0, 1).Render(content)
 	}
-	title := lipgloss.NewStyle().Foreground(white).Bold(true).Render(name)
-	label := lipgloss.NewStyle().Foreground(indigo).Render("GoTorrent")
-	status := m.m.Status()
-	if status == "" {
-		status = "Idle"
-	}
-	statusLine := lipgloss.NewStyle().Foreground(gray).Render(status)
-	return fmt.Sprintf("  %s  %s\n  %s", label, title, statusLine)
+	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(indigo).Padding(0, 1).Width(max(1, m.width-4)).Render(content)
 }
 
-// renderProgress renders the official bubbles/progress bar with percentage on the right.
-func (m Model) renderProgress() string {
-	return fmt.Sprintf("  %s  %5.1f%%", m.progress.ViewAs(m.percent), m.percent*100)
+func (m Model) status() string {
+	if m.localStatus != "" {
+		return m.localStatus
+	}
+	if status := m.m.Status(); status != "" {
+		return status
+	}
+	return "Initialising..."
 }
 
-// renderStats renders the stats row.
-func (m Model) renderStats() string {
+func (m Model) renderStats(compact bool, width int) string {
 	completed := piece.CountCompleted(m.m.Completed())
-	total := m.m.TotalPieces()
-	peers := len(m.m.Peers())
-
 	downloaded := int64(m.m.CompletedBytes())
-	speed := m.formatSpeed(m.downloadRate)
-	eta := m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded)
-	size := m.formatBytes(int64(m.m.TotalLength()))
-
-	sep := lipgloss.NewStyle().Foreground(grayDark).Render(" │ ")
-
-	statLine := StatLabel.Render("Pieces:") +
-		StatValue.Render(fmt.Sprintf("%d/%d", completed, total)) +
-		sep +
-		StatLabel.Render("Peers:") +
-		StatValue.Render(fmt.Sprintf("%d", peers)) +
-		sep +
-		StatLabel.Render("Speed:") +
-		SpeedStyle.Render(speed) +
-		sep +
-		StatLabel.Render("Size:") +
-		StatValue.Render(size) +
-		sep +
-		StatLabel.Render("ETA:") +
-		StatValue.Render(eta)
-
-	return "  " + statLine
+	if compact {
+		return fmt.Sprintf("%d/%d pcs  %s  ETA %s", completed, m.m.TotalPieces(), m.formatSpeed(m.downloadRate), m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded))
+	}
+	separator := lipgloss.NewStyle().Foreground(grayDark).Render(" │ ")
+	contents := []string{
+		StatLabel.Render("Pieces:") + StatValue.Render(fmt.Sprintf("%d/%d", completed, m.m.TotalPieces())),
+		StatLabel.Render("Sources:") + StatValue.Render(fmt.Sprintf("%d", len(m.m.SourceSnapshots()))),
+		StatLabel.Render("Speed:") + SpeedStyle.Render(m.formatSpeed(m.downloadRate)),
+		StatLabel.Render("Size:") + StatValue.Render(m.formatBytes(int64(m.m.TotalLength()))),
+		StatLabel.Render("ETA:") + StatValue.Render(m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded)),
+	}
+	available := max(5, width-4*lipgloss.Width(separator))
+	baseWidth := available / len(contents)
+	remainder := available % len(contents)
+	cells := make([]string, len(contents))
+	for index, content := range contents {
+		cellWidth := baseWidth
+		if index < remainder {
+			cellWidth++
+		}
+		cells[index] = lipgloss.NewStyle().Width(cellWidth).MaxWidth(cellWidth).Align(lipgloss.Center).Render(content)
+	}
+	return strings.Join(cells, separator)
 }
 
-// renderPieceMap renders a visual grid of piece completion status.
 func (m Model) renderPieceMap() string {
-	var out strings.Builder
-	out.WriteString(SectionStyle.Render("Piece Map"))
-	out.WriteString("\n")
-
 	completed := m.m.Completed()
-	totalPieces := m.m.TotalPieces()
-
-	if totalPieces == 0 {
-		return out.String()
+	total := m.m.TotalPieces()
+	if total == 0 {
+		return SectionStyle.Render("Piece Map") + "\n—"
 	}
-
-	width := m.pieceMapWidth
-	if width <= 0 {
-		width = 60
-	}
-
+	width := max(1, min(m.pieceMapWidth-2, total))
 	var row strings.Builder
-	row.WriteString("  ")
-	for i := 0; i < width && i < totalPieces; i++ {
-		pieceIdx := int(float64(i) / float64(width) * float64(totalPieces))
-		if pieceIdx >= len(completed) {
-			row.WriteString(PiecePending.String())
-		} else if completed[pieceIdx] {
+	for i := range width {
+		index := int(float64(i) / float64(width) * float64(total))
+		if index < len(completed) && completed[index] {
 			row.WriteString(PieceDone.String())
 		} else {
 			row.WriteString(PiecePending.String())
 		}
 	}
-	out.WriteString(row.String())
-	return out.String()
+	return SectionStyle.Render("Piece Map") + "\n" + row.String()
 }
-
-// renderPeerTable renders the peers table with real addresses.
-func (m Model) renderPeerTable() string {
-	var out strings.Builder
-	peers := m.m.Peers()
-
-	out.WriteString(SectionStyle.Render(fmt.Sprintf("Peers (%d)", len(peers))))
-	out.WriteString("\n")
-
-	if len(peers) == 0 {
-		out.WriteString("  ")
-		out.WriteString(HelpStyle.Render("No peers connected"))
-		return out.String()
-	}
-
-	// Column widths
-	addrW := 22
-	statusW := 12
-
-	// Header row (no decoration, just aligned)
-	header := fmt.Sprintf("  %-*s %*s",
-		addrW, "Address",
-		statusW, "Status")
-	out.WriteString(header)
-	out.WriteString("\n")
-
-	// Separator line
-	sep := fmt.Sprintf("  %s %s ",
-		strings.Repeat("─", addrW),
-		strings.Repeat("─", statusW))
-	out.WriteString(sep)
-	out.WriteString("\n")
-
-	// Rows — show up to 10
-	maxRows := 10
-	for i, p := range peers {
-		if i >= maxRows {
-			break
-		}
-		addr := p.RemoteAddr()
-		// Shorten IPv6 or long addresses
-		if len(addr) > addrW {
-			addr = addr[:addrW-3] + "..."
-		}
-		bf := p.Bitfield()
-		count := 0
-		for _, v := range bf {
-			if v {
-				count++
-			}
-		}
-
-		line := fmt.Sprintf("  %-*s %-*s",
-			addrW, addr,
-			statusW, "active")
-		out.WriteString(line)
-		out.WriteString("\n")
-	}
-
-	if len(peers) > maxRows {
-		out.WriteString("  ")
-		out.WriteString(HelpStyle.Render(fmt.Sprintf("... and %d more", len(peers)-maxRows)))
-		out.WriteString("\n")
-	}
-
-	return out.String()
-}
-
-// renderStatusBar renders the bottom status bar with keyboard shortcuts.
-func (m Model) renderStatusBar() string {
-	keys := []struct{ key, desc string }{
-		{"q", "quit"},
-	}
-
-	left := ""
-	for _, k := range keys {
-		left += KeyStyle.Render(k.key) + " " + DescStyle.Render(k.desc) + "  "
-	}
-
-	return StatusBarStyle.Render(left)
-}
-
-// Helpers
 
 func (m Model) formatSpeed(bytesPerSec float64) string {
 	switch {
@@ -426,24 +362,21 @@ func (m Model) formatETA(speed float64, remaining int64) string {
 	if speed <= 0 || remaining <= 0 {
 		return "—"
 	}
-	secs := float64(remaining) / speed
-	if math.IsInf(secs, 0) || math.IsNaN(secs) {
+	seconds := float64(remaining) / speed
+	if math.IsInf(seconds, 0) || math.IsNaN(seconds) {
 		return "—"
 	}
-	if secs < 60 {
-		return fmt.Sprintf("%.0fs", secs)
+	if seconds < 60 {
+		return fmt.Sprintf("%.0fs", seconds)
 	}
-	if secs < 3600 {
-		return fmt.Sprintf("%.0fm %.0fs", secs/60, math.Mod(secs, 60))
+	if seconds < 3600 {
+		return fmt.Sprintf("%.0fm %.0fs", seconds/60, math.Mod(seconds, 60))
 	}
-	return fmt.Sprintf("%.0fh %.0fm", secs/3600, math.Mod(secs/60, 60))
+	return fmt.Sprintf("%.0fh %.0fm", seconds/3600, math.Mod(seconds/60, 60))
 }
 
-// Run starts the Bubble Tea program with the given model.
-// doneCh receives nil on success or an error on failure.
-func Run(m *piece.Manager, doneCh <-chan error) error {
-	model := NewModel(m, doneCh)
-	p := tea.NewProgram(model)
-	_, err := p.Run()
+func Run(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc) error {
+	program := tea.NewProgram(NewModel(m, doneCh, reannounce, cancel))
+	_, err := program.Run()
 	return err
 }

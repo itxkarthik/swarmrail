@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/itxkarthik/GoTorrent/internal/torrent"
 )
@@ -41,6 +42,30 @@ func TestURLListSingleFileRange(t *testing.T) {
 	}
 	if string(data) != "4567" {
 		t.Fatalf("data = %q, want 4567", data)
+	}
+}
+
+func TestBaseSourceSnapshotReportsRuntimeState(t *testing.T) {
+	source := newBaseSource("https://seed.example/file")
+	if got := source.Snapshot(); got.State != StateReady || got.Name != "https://seed.example/file" {
+		t.Fatalf("initial snapshot = %+v, want ready", got)
+	}
+	source.mu.Lock()
+	source.active = 1
+	source.mu.Unlock()
+	if got := source.Snapshot(); got.State != StateFetching {
+		t.Fatalf("active snapshot = %+v, want fetching", got)
+	}
+	source.mu.Lock()
+	source.active = 0
+	source.backoffUntil = time.Now().Add(time.Minute)
+	source.mu.Unlock()
+	if got := source.Snapshot(); got.State != StateBackoff {
+		t.Fatalf("backoff snapshot = %+v, want backoff", got)
+	}
+	source.Disable()
+	if got := source.Snapshot(); got.State != StateDisabled {
+		t.Fatalf("disabled snapshot = %+v, want disabled", got)
 	}
 }
 
