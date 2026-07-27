@@ -3,6 +3,7 @@ package peer
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -20,7 +21,15 @@ const (
 	MsgCancel        MessageID = 8
 )
 
-var ErrInvalidMessage = errors.New("invalid message")
+const (
+	MaxBlockLength       = 16 * 1024
+	MaxPeerMessageLength = 4 * 1024 * 1024
+)
+
+var (
+	ErrInvalidMessage  = errors.New("invalid message")
+	ErrMessageTooLarge = errors.New("peer message too large")
+)
 
 type Message struct {
 	ID      MessageID
@@ -40,6 +49,9 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	if length == 0 {
 		return nil, nil
 	}
+	if length > MaxPeerMessageLength {
+		return nil, fmt.Errorf("%w: %d bytes", ErrMessageTooLarge, length)
+	}
 
 	// Read Payload: ID (1 byte) + Payload (length - 1 bytes)
 	payloadBuf := make([]byte, length)
@@ -54,9 +66,66 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	}, nil
 }
 
+// ValidateMessage enforces the BEP 3 payload shapes used by the client.
+// Unknown IDs are permitted so extension messages can be ignored safely.
+func ValidateMessage(msg *Message, totalPieces int) error {
+	if msg == nil {
+		return nil
+	}
+	invalid := func(format string, args ...any) error {
+		return fmt.Errorf("%w: %s", ErrInvalidMessage, fmt.Sprintf(format, args...))
+	}
+	switch msg.ID {
+	case MsgChoke, MsgUnchoke, MsgInterested, MsgNotInterested:
+		if len(msg.Payload) != 0 {
+			return invalid("message %d has %d-byte payload", msg.ID, len(msg.Payload))
+		}
+	case MsgHave:
+		if len(msg.Payload) != 4 {
+			return invalid("have payload is %d bytes", len(msg.Payload))
+		}
+		if totalPieces > 0 && binary.BigEndian.Uint32(msg.Payload) >= uint32(totalPieces) {
+			return invalid("have piece index out of range")
+		}
+	case MsgBitfield:
+		if totalPieces > 0 && len(msg.Payload) > (totalPieces+7)/8 {
+			return invalid("bitfield is %d bytes for %d pieces", len(msg.Payload), totalPieces)
+		}
+	case MsgRequest, MsgCancel:
+		if len(msg.Payload) != 12 {
+			return invalid("message %d payload is %d bytes", msg.ID, len(msg.Payload))
+		}
+		length := binary.BigEndian.Uint32(msg.Payload[8:12])
+		if length == 0 || length > MaxBlockLength {
+			return invalid("block length %d is outside 1..%d", length, MaxBlockLength)
+		}
+	case MsgPiece:
+		if len(msg.Payload) < 8 || len(msg.Payload) > 8+MaxBlockLength {
+			return invalid("piece payload is %d bytes", len(msg.Payload))
+		}
+	}
+	return nil
+}
+
+// ValidateRequest checks an upload request against the torrent's piece bounds.
+func ValidateRequest(work PieceWork, totalPieces int, pieceLength, totalLength int64) bool {
+	if work.Index < 0 || work.Index >= totalPieces || work.Begin < 0 || work.Length <= 0 || work.Length > MaxBlockLength {
+		return false
+	}
+	if pieceLength <= 0 || totalLength < 0 {
+		return false
+	}
+	pieceSize := pieceLength
+	if work.Index == totalPieces-1 {
+		pieceSize = totalLength - int64(work.Index)*pieceLength
+	}
+	begin, length := int64(work.Begin), int64(work.Length)
+	return pieceSize >= 0 && begin <= pieceSize && length <= pieceSize-begin
+}
+
 func WriteMessage(w io.Writer, msg *Message) error {
 	// length = 1 (ID) + len(Payload)
-	buf := make([]byte, 4+1+len(msg.Payload)) // 4 bytes for length, 1 byte for ID, len(Payload) bytes for payload
+	buf := make([]byte, 4+1+len(msg.Payload))                        // 4 bytes for length, 1 byte for ID, len(Payload) bytes for payload
 	binary.BigEndian.PutUint32(buf[0:4], uint32(1+len(msg.Payload))) // store the length of the payload (1 byte for ID + len(Payload))
 	buf[4] = byte(msg.ID)
 	copy(buf[5:], msg.Payload)

@@ -82,6 +82,25 @@ func TestVerifyPiece_MultiplePieces(t *testing.T) {
 	}
 }
 
+func TestUploadBlockRejectsInvalidRanges(t *testing.T) {
+	m := &Manager{
+		totalPieces: 2,
+		pieceLength: 4,
+		totalLength: 6,
+		completed:   []bool{true, true},
+	}
+	for _, work := range []peer.PieceWork{
+		{Index: -1, Begin: 0, Length: 1},
+		{Index: 2, Begin: 0, Length: 1},
+		{Index: 1, Begin: 1, Length: 2},
+		{Index: 0, Begin: 0, Length: peer.MaxBlockLength + 1},
+	} {
+		if data, ok := m.readUploadBlock(work); ok || data != nil {
+			t.Fatalf("readUploadBlock(%+v) = (%v, %v), want rejected", work, data, ok)
+		}
+	}
+}
+
 func TestDownloadWebSeedOnly(t *testing.T) {
 	piece0 := []byte("abcd")
 	piece1 := []byte("ef")
@@ -124,9 +143,7 @@ func TestDownloadAcceptsPeerAddedAtRuntime(t *testing.T) {
 		PieceHashes: [][20]byte{hash},
 	}
 
-	dormant, closeDormant := newServingPeer(t, []bool{false}, nil)
-	defer closeDormant()
-	m := NewManager(tf, []*peer.PeerConnection{dormant})
+	m := NewManager(tf, nil)
 	m.SetLogWriter(io.Discard)
 	dir := t.TempDir()
 	done := make(chan error, 1)
@@ -171,6 +188,34 @@ func TestDownloadAcceptsPeerAddedAtRuntime(t *testing.T) {
 	}
 }
 
+func TestAddPeersRejectsDuplicatePeerID(t *testing.T) {
+	firstClient, firstServer := net.Pipe()
+	defer firstServer.Close()
+	first := peer.NewPeerConnection(firstClient, [20]byte{1})
+	secondClient, secondServer := net.Pipe()
+	defer secondServer.Close()
+	second := peer.NewPeerConnection(secondClient, [20]byte{1})
+	m := NewManager(&torrent.TorrentFile{Name: "dupe", Length: 1, PieceLength: 1, PieceHashes: make([][20]byte, 1)}, nil)
+	if added := m.AddPeers([]*peer.PeerConnection{first, second}); added != 1 {
+		t.Fatalf("AddPeers() = %d, want one unique peer", added)
+	}
+	defer first.Close()
+}
+
+func TestAddPeersRejectsDuplicateEndpoint(t *testing.T) {
+	firstClient, firstServer := net.Pipe()
+	defer firstServer.Close()
+	first := peer.NewPeerConnection(firstClient, [20]byte{1})
+	secondClient, secondServer := net.Pipe()
+	defer secondServer.Close()
+	second := peer.NewPeerConnection(secondClient, [20]byte{2})
+	m := NewManager(&torrent.TorrentFile{Name: "dupe", Length: 1, PieceLength: 1, PieceHashes: make([][20]byte, 1)}, nil)
+	if added := m.AddPeers([]*peer.PeerConnection{first, second}); added != 1 {
+		t.Fatalf("AddPeers() = %d, want one unique endpoint", added)
+	}
+	defer first.Close()
+}
+
 func TestDownloadCancellationPersistsResumeState(t *testing.T) {
 	tf := &torrent.TorrentFile{
 		Name: "cancel.bin", Length: 4, PieceLength: 4,
@@ -213,7 +258,7 @@ func TestSourceSnapshotsIncludesWebseedsAndPeers(t *testing.T) {
 	if len(snapshots) != 2 {
 		t.Fatalf("SourceSnapshots() count = %d, want 2", len(snapshots))
 	}
-	if snapshots[0].Kind != SourcePeer || snapshots[0].State != "active" {
+	if snapshots[0].Kind != SourcePeer || snapshots[0].State != "active" || snapshots[0].Direction != "outbound" {
 		t.Fatalf("peer snapshot = %+v", snapshots[0])
 	}
 	if snapshots[1].Kind != SourceWebSeed || snapshots[1].Endpoint != "fake" || snapshots[1].State != "ready" {

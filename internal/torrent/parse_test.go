@@ -3,6 +3,7 @@ package torrent
 import (
 	"crypto/sha1"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -61,5 +62,50 @@ func TestParseRejectsInvalidFileModeMix(t *testing.T) {
 	var tf TorrentFile
 	if err := tf.Parse([]byte(raw)); err == nil {
 		t.Fatal("expected error for torrent with both length and files")
+	}
+}
+
+func TestParseRejectsUnsafeNames(t *testing.T) {
+	hash := sha1.Sum([]byte("test"))
+	for _, name := range []string{".", "..", "/tmp/file", `dir/file`, `dir\file`} {
+		t.Run(name, func(t *testing.T) {
+			raw := fmt.Sprintf("d4:infod6:lengthi4e4:name%d:%s12:piece lengthi4e6:pieces20:%see", len(name), name, string(hash[:]))
+			var tf TorrentFile
+			if err := tf.Parse([]byte(raw)); err == nil {
+				t.Fatalf("expected unsafe name %q to be rejected", name)
+			}
+		})
+	}
+}
+
+func TestParseRejectsUnsafeFilePathComponents(t *testing.T) {
+	hash := sha1.Sum([]byte("test"))
+	for _, component := range []string{".", "..", "/tmp", `dir/file`, `dir\file`} {
+		t.Run(component, func(t *testing.T) {
+			raw := fmt.Sprintf("d4:infod5:filesld6:lengthi4e4:pathl%d:%seee4:name4:test12:piece lengthi4e6:pieces20:%see", len(component), component, string(hash[:]))
+			var tf TorrentFile
+			if err := tf.Parse([]byte(raw)); err == nil {
+				t.Fatalf("expected unsafe path component %q to be rejected", component)
+			}
+		})
+	}
+}
+
+func TestParseRejectsNegativeAndOverflowingFileLengths(t *testing.T) {
+	tests := []struct {
+		name  string
+		files string
+	}{
+		{name: "negative", files: "d6:lengthi-1e4:pathl1:aee"},
+		{name: "overflow", files: fmt.Sprintf("d6:lengthi%de4:pathl1:aee6:lengthi1e4:pathl1:bee", int64(math.MaxInt64))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := fmt.Sprintf("d4:infod5:filesl%se4:name4:test12:piece lengthi4e6:pieces0:ee", tt.files)
+			var tf TorrentFile
+			if err := tf.Parse([]byte(raw)); err == nil {
+				t.Fatal("expected invalid file lengths to be rejected")
+			}
+		})
 	}
 }

@@ -57,6 +57,7 @@ type Model struct {
 	err              error
 	doneCh           <-chan error
 	reannounce       *session.ReannounceController
+	listener         *session.PeerListener
 	cancel           context.CancelFunc
 	localStatus      string
 	localStatusUntil time.Time
@@ -66,7 +67,7 @@ type Model struct {
 	downloadRate    float64
 }
 
-func NewModel(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc) Model {
+func NewModel(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc, listeners ...*session.PeerListener) Model {
 	progressModel := progress.New(progress.WithColors(green), progress.WithoutPercentage())
 	spinnerModel := spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(lipgloss.NewStyle().Foreground(indigo)))
 	tableStyles := table.DefaultStyles()
@@ -81,6 +82,9 @@ func NewModel(m *piece.Manager, doneCh <-chan error, reannounce *session.Reannou
 		progress: progressModel, spinner: spinnerModel, sources: sources,
 		help: helpModel, keys: defaultKeyMap(), pieceMapWidth: 60,
 		transferSamples: []transferSample{{at: time.Now(), bytes: m.TransferredBytes()}},
+	}
+	if len(listeners) > 0 {
+		model.listener = listeners[0]
 	}
 	model.refreshSources(60)
 	return model
@@ -198,7 +202,13 @@ func (m *Model) refreshSources(width int) {
 	m.sources.SetColumns([]table.Column{{Title: "Type", Width: kindWidth}, {Title: "Endpoint", Width: endpointWidth}, {Title: "State", Width: stateWidth}})
 	rows := make([]table.Row, 0)
 	for _, source := range m.m.SourceSnapshots() {
-		rows = append(rows, table.Row{string(source.Kind), source.Endpoint, source.State})
+		kind := string(source.Kind)
+		if source.Direction == "inbound" {
+			kind = "peer/in"
+		} else if source.Direction == "outbound" {
+			kind = "peer/out"
+		}
+		rows = append(rows, table.Row{kind, source.Endpoint, source.State})
 	}
 	if len(rows) == 0 {
 		rows = append(rows, table.Row{"—", "Waiting for sources", "idle"})
@@ -256,6 +266,9 @@ func (m Model) renderMain() string {
 	stats := m.renderStats(m.width < 70, innerWidth)
 	sources := SectionStyle.Render("Sources") + "\n" + m.sources.View()
 	parts := []string{header, m.spinner.View() + " " + status, progressLine, stats}
+	if listenerStatus := m.listenerStatus(); listenerStatus != "" {
+		parts = append(parts, listenerStatus)
+	}
 	if m.width >= 100 && m.height >= 22 {
 		piecePanel := lipgloss.NewStyle().Width(m.pieceMapWidth).Render(m.renderPieceMap())
 		sourcePanel := lipgloss.NewStyle().Width(m.sources.Width()).Render(sources)
@@ -268,6 +281,18 @@ func (m Model) renderMain() string {
 	}
 	parts = append(parts, m.help.View(m.keys))
 	return m.wrap(strings.Join(parts, "\n"))
+}
+
+func (m Model) listenerStatus() string {
+	if m.listener == nil {
+		return ""
+	}
+	snapshot := m.listener.Snapshot()
+	state := "stopped"
+	if snapshot.Running {
+		state = "listening"
+	}
+	return lipgloss.NewStyle().Foreground(grayLight).Render(fmt.Sprintf("Inbound: %s on %s  accepted %d  rejected %d", state, snapshot.Address, snapshot.Accepted, snapshot.Rejected))
 }
 
 func (m Model) wrap(content string) string {
@@ -291,17 +316,18 @@ func (m Model) renderStats(compact bool, width int) string {
 	completed := piece.CountCompleted(m.m.Completed())
 	downloaded := int64(m.m.CompletedBytes())
 	if compact {
-		return fmt.Sprintf("%d/%d pcs  %s  ETA %s", completed, m.m.TotalPieces(), m.formatSpeed(m.downloadRate), m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded))
+		return fmt.Sprintf("%d/%d pcs  %s  Up %s  ETA %s", completed, m.m.TotalPieces(), m.formatSpeed(m.downloadRate), m.formatBytes(int64(m.m.UploadedBytes())), m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded))
 	}
 	separator := lipgloss.NewStyle().Foreground(grayDark).Render(" │ ")
 	contents := []string{
 		StatLabel.Render("Pieces:") + StatValue.Render(fmt.Sprintf("%d/%d", completed, m.m.TotalPieces())),
 		StatLabel.Render("Sources:") + StatValue.Render(fmt.Sprintf("%d", len(m.m.SourceSnapshots()))),
 		StatLabel.Render("Speed:") + SpeedStyle.Render(m.formatSpeed(m.downloadRate)),
+		StatLabel.Render("Uploaded:") + StatValue.Render(m.formatBytes(int64(m.m.UploadedBytes()))),
 		StatLabel.Render("Size:") + StatValue.Render(m.formatBytes(int64(m.m.TotalLength()))),
 		StatLabel.Render("ETA:") + StatValue.Render(m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded)),
 	}
-	available := max(5, width-4*lipgloss.Width(separator))
+	available := max(len(contents), width-(len(contents)-1)*lipgloss.Width(separator))
 	baseWidth := available / len(contents)
 	remainder := available % len(contents)
 	cells := make([]string, len(contents))
@@ -375,8 +401,8 @@ func (m Model) formatETA(speed float64, remaining int64) string {
 	return fmt.Sprintf("%.0fh %.0fm", seconds/3600, math.Mod(seconds/60, 60))
 }
 
-func Run(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc) error {
-	program := tea.NewProgram(NewModel(m, doneCh, reannounce, cancel))
+func Run(m *piece.Manager, doneCh <-chan error, reannounce *session.ReannounceController, cancel context.CancelFunc, listeners ...*session.PeerListener) error {
+	program := tea.NewProgram(NewModel(m, doneCh, reannounce, cancel, listeners...))
 	_, err := program.Run()
 	return err
 }

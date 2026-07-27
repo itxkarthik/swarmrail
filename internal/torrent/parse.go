@@ -2,6 +2,9 @@ package torrent
 
 import (
 	"fmt"
+	"math"
+	"path/filepath"
+	"strings"
 
 	"github.com/itxkarthik/GoTorrent/internal/bencode"
 )
@@ -85,6 +88,9 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	}
 	if name == "" {
 		return fmt.Errorf("invalid torrent: empty name")
+	}
+	if !safePathComponent(name) {
+		return fmt.Errorf("invalid torrent: unsafe name %q", name)
 	}
 	piecesStr, ok := infoMap["pieces"].(string)
 	if !ok {
@@ -228,6 +234,12 @@ func sumFilesLength(files []any) (int64, error) {
 		if !ok {
 			return 0, fmt.Errorf("invalid torrent: file entry missing length")
 		}
+		if lengthVal < 0 {
+			return 0, fmt.Errorf("invalid torrent: negative file length")
+		}
+		if total > math.MaxInt64-lengthVal {
+			return 0, fmt.Errorf("invalid torrent: total file length overflows int64")
+		}
 		total += lengthVal
 	}
 	return total, nil
@@ -244,6 +256,9 @@ func parseFileEntries(files []any) ([]FileEntry, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid torrent: file entry missing length")
 		}
+		if lengthVal < 0 {
+			return nil, fmt.Errorf("invalid torrent: negative file length")
+		}
 		pathVal, ok := fileMap["path"].([]any)
 		if !ok {
 			return nil, fmt.Errorf("invalid torrent: file entry missing path")
@@ -257,14 +272,24 @@ func parseFileEntries(files []any) ([]FileEntry, error) {
 			if !ok {
 				return nil, fmt.Errorf("invalid torrent: file path component not a string")
 			}
-			if s == "" {
-				return nil, fmt.Errorf("invalid torrent: empty file path component")
+			if !safePathComponent(s) {
+				return nil, fmt.Errorf("invalid torrent: unsafe file path component %q", s)
 			}
 			path[i] = s
 		}
 		entries = append(entries, FileEntry{Length: lengthVal, Path: path})
 	}
 	return entries, nil
+}
+
+// safePathComponent accepts exactly one portable relative path component.
+// Torrent metadata is untrusted and must never choose a parent directory.
+func safePathComponent(component string) bool {
+	return component != "" &&
+		component != "." &&
+		component != ".." &&
+		!filepath.IsAbs(component) &&
+		!strings.ContainsAny(component, `/\`)
 }
 
 func splitPieceHashes(pieces []byte) ([][20]byte, error) {

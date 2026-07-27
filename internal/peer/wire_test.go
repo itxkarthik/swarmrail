@@ -2,6 +2,8 @@ package peer
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -28,6 +30,69 @@ func TestReadMessage_Choke(t *testing.T) {
 	}
 	if len(msg.Payload) != 0 {
 		t.Fatalf("expected empty payload, got %d bytes", len(msg.Payload))
+	}
+}
+
+func TestReadMessageRejectsOversizedFrameBeforeReadingPayload(t *testing.T) {
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], MaxPeerMessageLength+1)
+	_, err := ReadMessage(bytes.NewReader(header[:]))
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("ReadMessage error = %v, want ErrMessageTooLarge", err)
+	}
+}
+
+func TestValidateMessagePayloadSizes(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *Message
+	}{
+		{"choke payload", &Message{ID: MsgChoke, Payload: []byte{1}}},
+		{"have short", &Message{ID: MsgHave, Payload: make([]byte, 3)}},
+		{"have long", &Message{ID: MsgHave, Payload: make([]byte, 5)}},
+		{"request short", &Message{ID: MsgRequest, Payload: make([]byte, 11)}},
+		{"cancel long", &Message{ID: MsgCancel, Payload: make([]byte, 13)}},
+		{"piece short", &Message{ID: MsgPiece, Payload: make([]byte, 7)}},
+		{"piece block too large", &Message{ID: MsgPiece, Payload: make([]byte, 8+MaxBlockLength+1)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateMessage(tt.msg, 0); !errors.Is(err, ErrInvalidMessage) {
+				t.Fatalf("ValidateMessage error = %v, want ErrInvalidMessage", err)
+			}
+		})
+	}
+}
+
+func TestValidateMessageRejectsOversizedBitfield(t *testing.T) {
+	msg := &Message{ID: MsgBitfield, Payload: make([]byte, 3)}
+	if err := ValidateMessage(msg, 9); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("ValidateMessage error = %v, want ErrInvalidMessage", err)
+	}
+}
+
+func TestValidateMessageAllowsUnknownExtensionID(t *testing.T) {
+	if err := ValidateMessage(&Message{ID: 20, Payload: []byte("extension")}, 1); err != nil {
+		t.Fatalf("unknown extension message rejected: %v", err)
+	}
+}
+
+func TestValidateRequestBounds(t *testing.T) {
+	tests := []PieceWork{
+		{Index: -1, Begin: 0, Length: 1},
+		{Index: 2, Begin: 0, Length: 1},
+		{Index: 0, Begin: -1, Length: 1},
+		{Index: 0, Begin: 0, Length: 0},
+		{Index: 0, Begin: 0, Length: MaxBlockLength + 1},
+		{Index: 1, Begin: 3, Length: 2},
+	}
+	for _, work := range tests {
+		if ValidateRequest(work, 2, 4, 8) {
+			t.Fatalf("ValidateRequest(%+v) = true, want false", work)
+		}
+	}
+	if !ValidateRequest(PieceWork{Index: 1, Begin: 0, Length: 4}, 2, 4, 8) {
+		t.Fatal("valid request rejected")
 	}
 }
 

@@ -312,3 +312,51 @@ func TestPeerConnection_ReaderStopsOnClose(t *testing.T) {
 	// Close should still be safe
 	pc.Close()
 }
+
+func TestPeerConnectionCountsSuccessfullyUploadedPayload(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewInboundPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(1, 4, 4)
+	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return []byte("data"), true })
+	pc.Start()
+	if err := WriteMessage(server, BuildRequest(0, 0, 4)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := ReadMessage(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ID != MsgPiece || string(msg.Payload[8:]) != "data" {
+		t.Fatalf("response = %+v", msg)
+	}
+	deadline := time.Now().Add(time.Second)
+	for pc.UploadedBytes() != 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := pc.UploadedBytes(); got != 4 {
+		t.Fatalf("UploadedBytes() = %d, want 4", got)
+	}
+	pc.Close()
+}
+
+func TestPeerConnectionTracksLateBitfieldAndSignalsAvailability(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewInboundPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(2, 4, 8)
+	pc.SetBitfield(make([]bool, 2))
+	pc.Start()
+	if err := WriteMessage(server, &Message{ID: MsgBitfield, Payload: []byte{0b10000000}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pc.AvailabilityChanged():
+	case <-time.After(time.Second):
+		t.Fatal("late bitfield did not signal availability")
+	}
+	if bits := pc.Bitfield(); len(bits) != 2 || !bits[0] || bits[1] {
+		t.Fatalf("bitfield = %v, want [true false]", bits)
+	}
+	pc.Close()
+}

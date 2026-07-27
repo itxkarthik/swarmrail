@@ -80,6 +80,7 @@ func runPeriodicReannounceWith(
 			PeerID:     config.PeerID,
 			Port:       config.Port,
 			Downloaded: completed,
+			Uploaded:   config.Manager.UploadedBytes(),
 			Left:       config.Manager.TotalLength() - completed,
 			Event:      tracker.EventNone,
 		}

@@ -26,6 +26,14 @@ type PeerConnection struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	closeOnce     sync.Once
+	direction     Direction
+	uploaded      atomic.Uint64
+	totalPieces   int
+	pieceLength   int64
+	totalLength   int64
+	metadataMu    sync.RWMutex
+	bitfieldMu    sync.RWMutex
+	availability  chan struct{}
 
 	// Choked wait: writer parks here when choked, reader signals on unchoke
 	unchokeMu   sync.Mutex
@@ -33,7 +41,15 @@ type PeerConnection struct {
 
 	// Upload callback: set by Manager to serve piece data from disk
 	getPieceData func(PieceWork) ([]byte, bool)
+	handlerMu    sync.RWMutex
 }
+
+type Direction string
+
+const (
+	DirectionOutbound Direction = "outbound"
+	DirectionInbound  Direction = "inbound"
+)
 
 type PieceWork struct {
 	Index  int
@@ -42,6 +58,14 @@ type PieceWork struct {
 }
 
 func NewPeerConnection(conn net.Conn, peerID [20]byte) *PeerConnection {
+	return newPeerConnection(conn, peerID, DirectionOutbound)
+}
+
+func NewInboundPeerConnection(conn net.Conn, peerID [20]byte) *PeerConnection {
+	return newPeerConnection(conn, peerID, DirectionInbound)
+}
+
+func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *PeerConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	pc := &PeerConnection{
 		conn:          conn,
@@ -52,6 +76,8 @@ func NewPeerConnection(conn net.Conn, peerID [20]byte) *PeerConnection {
 		outgoing:      make(chan *Message, 10),
 		ctx:           ctx,
 		cancel:        cancel,
+		direction:     direction,
+		availability:  make(chan struct{}, 1),
 	}
 	pc.choked.Store(true)
 	pc.unchokeCond = sync.NewCond(&pc.unchokeMu)
@@ -79,6 +105,10 @@ func (pc *PeerConnection) reader() {
 		if msg == nil {
 			continue // keep-alive
 		}
+		totalPieces, pieceLength, totalLength := pc.torrentMetadata()
+		if err := ValidateMessage(msg, totalPieces); err != nil {
+			return
+		}
 
 		// Handle messages that need routing before the generic incoming channel.
 		switch msg.ID {
@@ -94,8 +124,12 @@ func (pc *PeerConnection) reader() {
 				index := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
 				begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
 				length := int(binary.BigEndian.Uint32(msg.Payload[8:12]))
+				work := PieceWork{Index: index, Begin: begin, Length: length}
+				if !ValidateRequest(work, totalPieces, pieceLength, totalLength) {
+					continue
+				}
 				select {
-				case pc.pieceRequests <- PieceWork{Index: index, Begin: begin, Length: length}:
+				case pc.pieceRequests <- work:
 				case <-pc.ctx.Done():
 					return
 				}
@@ -107,6 +141,11 @@ func (pc *PeerConnection) reader() {
 			continue
 		case MsgNotInterested:
 			continue
+		case MsgBitfield:
+			pc.SetBitfield(ParseBitfield(msg.Payload, totalPieces))
+			pc.signalAvailability()
+		case MsgHave:
+			pc.MarkPieceAvailable(binary.BigEndian.Uint32(msg.Payload))
 		}
 
 		// Route all other messages (piece, have, bitfield, etc.) to incoming.
@@ -143,7 +182,19 @@ func (pc *PeerConnection) AssignWork(work PieceWork) bool {
 // SetPieceDataHandler registers a callback that the writer uses to look up
 // piece data when serving upload requests from the remote peer.
 func (pc *PeerConnection) SetPieceDataHandler(handler func(PieceWork) ([]byte, bool)) {
+	pc.handlerMu.Lock()
+	defer pc.handlerMu.Unlock()
 	pc.getPieceData = handler
+}
+
+func (pc *PeerConnection) pieceData(work PieceWork) ([]byte, bool) {
+	pc.handlerMu.RLock()
+	handler := pc.getPieceData
+	pc.handlerMu.RUnlock()
+	if handler == nil {
+		return nil, false
+	}
+	return handler(work)
 }
 
 // SendHave queues a Have message to announce a newly completed piece.
@@ -199,10 +250,7 @@ func (pc *PeerConnection) writer() {
 				return
 			}
 			// Upload: remote peer requested a piece from us.
-			if pc.getPieceData == nil {
-				continue
-			}
-			data, ok := pc.getPieceData(req)
+			data, ok := pc.pieceData(req)
 			if !ok || len(data) == 0 {
 				continue
 			}
@@ -230,7 +278,13 @@ func (pc *PeerConnection) writeMessage(msg *Message) error {
 	if err := pc.conn.SetWriteDeadline(time.Now().Add(defaultTimeout)); err != nil {
 		return err
 	}
-	return WriteMessage(pc.conn, msg)
+	if err := WriteMessage(pc.conn, msg); err != nil {
+		return err
+	}
+	if msg.ID == MsgPiece && len(msg.Payload) >= 8 {
+		pc.uploaded.Add(uint64(len(msg.Payload) - 8))
+	}
+	return nil
 }
 
 // waitForUnchoke blocks until the peer unchokes us or the context is cancelled.
@@ -265,13 +319,57 @@ func (pc *PeerConnection) Close() {
 
 // SetBitfield updates the peer's bitfield (which pieces the peer has).
 func (pc *PeerConnection) SetBitfield(bitfield []bool) {
+	pc.bitfieldMu.Lock()
+	defer pc.bitfieldMu.Unlock()
 	pc.bitfield = bitfield
 }
 
 // Bitfield returns the peer's current bitfield.
 func (pc *PeerConnection) Bitfield() []bool {
-	return pc.bitfield
+	pc.bitfieldMu.RLock()
+	defer pc.bitfieldMu.RUnlock()
+	out := make([]bool, len(pc.bitfield))
+	copy(out, pc.bitfield)
+	return out
 }
+
+func (pc *PeerConnection) MarkPieceAvailable(index uint32) {
+	pc.bitfieldMu.Lock()
+	defer pc.bitfieldMu.Unlock()
+	if int(index) < len(pc.bitfield) {
+		pc.bitfield[index] = true
+	}
+	pc.signalAvailability()
+}
+
+func (pc *PeerConnection) signalAvailability() {
+	select {
+	case pc.availability <- struct{}{}:
+	default:
+	}
+}
+
+func (pc *PeerConnection) AvailabilityChanged() <-chan struct{} { return pc.availability }
+
+// ConfigureTorrent enables semantic validation of peer bitfields and requests.
+func (pc *PeerConnection) ConfigureTorrent(totalPieces int, pieceLength, totalLength int64) {
+	pc.metadataMu.Lock()
+	defer pc.metadataMu.Unlock()
+	pc.totalPieces = totalPieces
+	pc.pieceLength = pieceLength
+	pc.totalLength = totalLength
+}
+
+func (pc *PeerConnection) torrentMetadata() (int, int64, int64) {
+	pc.metadataMu.RLock()
+	defer pc.metadataMu.RUnlock()
+	return pc.totalPieces, pc.pieceLength, pc.totalLength
+}
+
+func (pc *PeerConnection) Direction() Direction  { return pc.direction }
+func (pc *PeerConnection) PeerID() [20]byte      { return pc.peerID }
+func (pc *PeerConnection) UploadedBytes() uint64 { return pc.uploaded.Load() }
+func (pc *PeerConnection) Active() bool          { return pc.ctx.Err() == nil }
 
 // Incoming returns the read-only channel of messages from this peer.
 func (pc *PeerConnection) Incoming() <-chan *Message {

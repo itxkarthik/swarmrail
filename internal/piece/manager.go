@@ -40,9 +40,10 @@ const (
 )
 
 type SourceSnapshot struct {
-	Kind     SourceKind
-	Endpoint string
-	State    string
+	Kind      SourceKind
+	Endpoint  string
+	State     string
+	Direction string
 }
 
 // Manager orchestrates piece downloading across multiple peers.
@@ -120,11 +121,12 @@ func (m *Manager) Download(parent context.Context, outputPath string, resume boo
 			}
 		}
 	}()
-	if len(m.peers) == 0 && len(m.webseeds) == 0 {
-		return fmt.Errorf("no peers or webseeds available")
-	}
 	if len(m.peers) == 0 {
-		fmt.Fprintf(m.logWriter, "No peers available; using %d webseed(s)\n", len(m.webseeds))
+		if len(m.webseeds) > 0 {
+			fmt.Fprintf(m.logWriter, "No peers available; using %d webseed(s)\n", len(m.webseeds))
+		} else {
+			m.SetStatus("Waiting for inbound peers...")
+		}
 	}
 
 	// If all pieces already completed, nothing to do
@@ -221,40 +223,30 @@ func (m *Manager) Download(parent context.Context, outputPath string, resume boo
 }
 
 func (m *Manager) initPeerUpload(p *peer.PeerConnection) {
-	p.SetPieceDataHandler(func(work peer.PieceWork) ([]byte, bool) {
-		m.mu.Lock()
-		completed := int(work.Index) < len(m.completed) && m.completed[work.Index]
-		pw := m.pw
-		m.mu.Unlock()
-
-		if !completed || pw == nil {
-			return nil, false
-		}
-
-		pieceSize := m.sizeOfPiece(work.Index)
-
-		// Clamp length to piece boundary
-		length := work.Length
-		if uint64(work.Begin)+uint64(length) > pieceSize {
-			length = int(pieceSize - uint64(work.Begin))
-		}
-		if length <= 0 {
-			return nil, false
-		}
-
-		data := make([]byte, length)
-		n, err := pw.ReadPiece(uint32(work.Index), data)
-		if err != nil || n != len(data) {
-			return nil, false
-		}
-		return data, true
-	})
+	p.ConfigureTorrent(m.totalPieces, int64(m.pieceLength), int64(m.totalLength))
+	p.SetPieceDataHandler(m.readUploadBlock)
 
 	bitfieldBytes := peer.BuildBitfieldBytes(m.Completed())
 	// Send our bitfield so the peer knows what we have.
 	if len(bitfieldBytes) > 0 {
 		p.SendBitfield(bitfieldBytes)
 	}
+}
+
+func (m *Manager) readUploadBlock(work peer.PieceWork) ([]byte, bool) {
+	if !peer.ValidateRequest(work, m.totalPieces, int64(m.pieceLength), int64(m.totalLength)) {
+		return nil, false
+	}
+	m.mu.Lock()
+	completed := m.completed[work.Index]
+	pw := m.pw
+	m.mu.Unlock()
+	if !completed || pw == nil {
+		return nil, false
+	}
+	data := make([]byte, work.Length)
+	n, err := pw.ReadPiece(uint32(work.Index), data)
+	return data, err == nil && n == len(data)
 }
 
 // announceHave sends a Have message to all connected peers when we complete a piece.
@@ -293,7 +285,14 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 		}
 		idx := m.nextPiece(p)
 		if idx == -1 {
-			return // no more work for this peer
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.Done():
+				return
+			case <-p.AvailabilityChanged():
+				continue
+			}
 		}
 
 		pieceSize := m.sizeOfPiece(idx)
@@ -481,10 +480,7 @@ func (m *Manager) waitForPieceMessage(p *peer.PeerConnection) *peer.Message {
 			// Track have messages to keep bitfield current.
 			if msg.ID == peer.MsgHave && len(msg.Payload) == 4 {
 				idx := binary.BigEndian.Uint32(msg.Payload)
-				bf := p.Bitfield()
-				if int(idx) < len(bf) {
-					bf[idx] = true
-				}
+				p.MarkPieceAvailable(idx)
 			}
 		case <-p.Done():
 			return nil
@@ -582,17 +578,42 @@ func (m *Manager) SetPeers(peers []*peer.PeerConnection) {
 // AddPeers appends newly discovered connections and starts workers immediately
 // when a download is active. It returns the number of accepted connections.
 func (m *Manager) AddPeers(peers []*peer.PeerConnection) int {
-	valid := make([]*peer.PeerConnection, 0, len(peers))
-	for _, p := range peers {
-		if p != nil {
-			valid = append(valid, p)
+	m.mu.Lock()
+	seenIDs := make(map[[20]byte]struct{}, len(m.peers)+len(peers))
+	seenEndpoints := make(map[string]struct{}, len(m.peers)+len(peers))
+	for _, existing := range m.peers {
+		if existing != nil {
+			if existing.PeerID() != ([20]byte{}) {
+				seenIDs[existing.PeerID()] = struct{}{}
+			}
+			seenEndpoints[existing.RemoteAddr()] = struct{}{}
 		}
 	}
+	valid := make([]*peer.PeerConnection, 0, len(peers))
+	for _, candidate := range peers {
+		if candidate == nil || !candidate.Active() {
+			continue
+		}
+		id := candidate.PeerID()
+		if id != ([20]byte{}) {
+			if _, duplicate := seenIDs[id]; duplicate {
+				candidate.Close()
+				continue
+			}
+			seenIDs[id] = struct{}{}
+		}
+		endpoint := candidate.RemoteAddr()
+		if _, duplicate := seenEndpoints[endpoint]; duplicate {
+			candidate.Close()
+			continue
+		}
+		seenEndpoints[endpoint] = struct{}{}
+		valid = append(valid, candidate)
+	}
 	if len(valid) == 0 {
+		m.mu.Unlock()
 		return 0
 	}
-
-	m.mu.Lock()
 	m.peers = append(m.peers, valid...)
 	ctx := m.downloadCtx
 	active := m.downloading && ctx != nil
@@ -648,7 +669,11 @@ func (m *Manager) SourceSnapshots() []SourceSnapshot {
 		if connection == nil {
 			continue
 		}
-		out = append(out, SourceSnapshot{Kind: SourcePeer, Endpoint: connection.RemoteAddr(), State: "active"})
+		state := "active"
+		if !connection.Active() {
+			state = "closed"
+		}
+		out = append(out, SourceSnapshot{Kind: SourcePeer, Endpoint: connection.RemoteAddr(), State: state, Direction: string(connection.Direction())})
 	}
 	for _, source := range webseeds {
 		snapshot := source.Snapshot()
@@ -680,6 +705,17 @@ func (m *Manager) CompletedBytes() uint64 {
 // TransferredBytes returns accepted download payload bytes. Unlike
 // CompletedBytes, it includes data that is later rejected or downloaded again.
 func (m *Manager) TransferredBytes() uint64 { return m.transferred.Load() }
+
+// UploadedBytes returns payload bytes successfully written to remote peers.
+func (m *Manager) UploadedBytes() uint64 {
+	var total uint64
+	for _, connection := range m.Peers() {
+		if connection != nil {
+			total += connection.UploadedBytes()
+		}
+	}
+	return total
+}
 
 // Peers returns the list of connected peer connections.
 func (m *Manager) Peers() []*peer.PeerConnection {

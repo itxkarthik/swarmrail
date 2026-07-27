@@ -1,11 +1,60 @@
 package peer
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestAcceptHandshakeValidatesThenResponds(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	infoHash := [20]byte{1, 2, 3}
+	localID := [20]byte{4, 5, 6}
+	remoteID := [20]byte{7, 8, 9}
+	type result struct {
+		id  [20]byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		id, err := AcceptHandshake(server, infoHash, localID)
+		done <- result{id: id, err: err}
+	}()
+
+	if _, err := client.Write(buildHandshake(infoHash, remoteID)); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, handshakeLength)
+	if _, err := io.ReadFull(client, response); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response, buildHandshake(infoHash, localID)) {
+		t.Fatalf("response = %x, want local handshake", response)
+	}
+	got := <-done
+	if got.err != nil || got.id != remoteID {
+		t.Fatalf("AcceptHandshake() = (%x, %v), want remote ID", got.id, got.err)
+	}
+}
+
+func TestAcceptHandshakeRejectsWrongInfoHashWithoutResponding(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := AcceptHandshake(server, [20]byte{1}, [20]byte{2})
+		done <- err
+	}()
+	if _, err := client.Write(buildHandshake([20]byte{9}, [20]byte{3})); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != ErrInvalidHandshake {
+		t.Fatalf("AcceptHandshake error = %v, want ErrInvalidHandshake", err)
+	}
+}
 
 // startMockPeer starts a local TCP listener that acts as a BitTorrent peer.
 // When sendValid is true it responds with a valid handshake echoing the

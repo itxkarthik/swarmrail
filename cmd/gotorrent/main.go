@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -123,6 +124,9 @@ func run() error {
 	if flag.NArg() < 1 {
 		return fmt.Errorf("Usage: gotorrent [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
 	}
+	if *port < 0 || *port > 65535 {
+		return fmt.Errorf("invalid listen port %d: must be between 0 and 65535", *port)
+	}
 
 	torrentPath := flag.Arg(0)
 	torrentData, err := os.ReadFile(torrentPath)
@@ -162,9 +166,24 @@ func run() error {
 	}
 
 	m.EnablePeriodicSave(statePath, tf.InfoHash)
+	peerListener, err := session.NewPeerListener(net.JoinHostPort("", fmt.Sprintf("%d", *port)), &tf, peerID, m)
+	if err != nil {
+		return fmt.Errorf("listening for inbound peers on port %d: %w", *port, err)
+	}
+	listenCtx, stopListener := context.WithCancel(ctx)
+	listenerDone := make(chan error, 1)
+	go func() { listenerDone <- peerListener.Run(listenCtx) }()
+	defer func() {
+		stopListener()
+		<-listenerDone
+	}()
+	announcePort := peerListener.Port()
+	if !*tuiMode {
+		fmt.Printf("Listening for inbound peers on %s\n", peerListener.Addr())
+	}
 
 	if *tuiMode {
-		return runTUIFlow(ctx, m, statePath, outputPath, &tf, peerID, uint16(*port))
+		return runTUIFlow(ctx, m, statePath, outputPath, &tf, peerID, announcePort, peerListener)
 	}
 
 	var (
@@ -184,8 +203,9 @@ func run() error {
 				discovery, announceErr := announceToTracker(ctx, tf.AnnounceList, tracker.AnnounceRequest{
 					InfoHash:   tf.InfoHash,
 					PeerID:     peerID,
-					Port:       uint16(*port),
+					Port:       announcePort,
 					Downloaded: completed,
+					Uploaded:   m.UploadedBytes(),
 					Left:       m.TotalLength() - completed,
 					Event:      announceEvent,
 				}, false)
@@ -200,9 +220,10 @@ func run() error {
 		)
 		if err != nil && len(peers) == 0 {
 			if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
-				return fmt.Errorf("announcing to trackers after fallback: %w", err)
+				fmt.Fprintf(os.Stderr, "Warning: tracker discovery failed; waiting for inbound peers: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: tracker announce failed; falling back to webseeds: %v\n", err)
 			}
-			fmt.Fprintf(os.Stderr, "Warning: tracker announce failed; falling back to webseeds: %v\n", err)
 		}
 	} else if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 		return fmt.Errorf("torrent has no tracker announce URL or webseed URL")
@@ -214,12 +235,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "Peer connection summary: %d dialed, %d handshaken, %d usable\n",
 			connectReport.Dialed, connectReport.Handshaken, len(connections))
 	}
-	if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
-		return fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
-			len(peers), connectReport.Dialed, connectReport.Handshaken)
-	}
-
-	m.SetPeers(connections)
+	m.AddPeers(connections)
 	defer closePeerConnections(m.Peers)
 
 	var cancelReannounce context.CancelFunc
@@ -233,7 +249,7 @@ func run() error {
 			session.RunPeriodicReannounce(reannounceCtx, session.Config{
 				Torrent:        &tf,
 				PeerID:         peerID,
-				Port:           uint16(*port),
+				Port:           announcePort,
 				Manager:        m,
 				InitialPeers:   peers,
 				InitialResults: announceResults,
@@ -260,7 +276,7 @@ func run() error {
 	return nil
 }
 
-func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath string, tf *torrent.TorrentFile, peerID [20]byte, port uint16) error {
+func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath string, tf *torrent.TorrentFile, peerID [20]byte, port uint16, peerListener *session.PeerListener) error {
 	m.SetLogWriter(io.Discard) // suppress stderr progress in TUI mode
 	doneCh := make(chan error, 1)
 	workerResult := make(chan error, 1)
@@ -294,6 +310,7 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 						PeerID:     peerID,
 						Port:       port,
 						Downloaded: completed,
+						Uploaded:   m.UploadedBytes(),
 						Left:       m.TotalLength() - completed,
 						Event:      announceEvent,
 					}, true)
@@ -308,30 +325,15 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 			)
 		}
 
-		if len(peers) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
-			m.SetStatus("No peers or webseeds available")
-			if announceErr != nil {
-				err := fmt.Errorf("tracker discovery failed after fallback: %w", announceErr)
-				doneCh <- err
-				workerResult <- err
-			} else {
-				err := fmt.Errorf("no peers or webseeds available after tracker fallback")
-				doneCh <- err
-				workerResult <- err
-			}
-			return
+		if len(peers) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 && announceErr != nil {
+			m.SetStatus("Tracker discovery failed; waiting for inbound peers")
 		}
 
-		m.SetPeers(connections)
+		m.AddPeers(connections)
 		defer closePeerConnections(m.Peers)
 
 		if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
-			m.SetStatus("No peers connected")
-			err := fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
-				len(peers), connectReport.Dialed, connectReport.Handshaken)
-			doneCh <- err
-			workerResult <- err
-			return
+			m.SetStatus(fmt.Sprintf("Waiting for inbound peers (%d candidates, %d handshakes)", len(peers), connectReport.Handshaken))
 		}
 
 		if len(connections) == 0 {
@@ -375,7 +377,7 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 		workerResult <- err
 	}()
 
-	tuiErr := tui.Run(m, doneCh, controller, cancel)
+	tuiErr := tui.Run(m, doneCh, controller, cancel, peerListener)
 	cancel()
 	workerErr := <-workerResult
 	if tuiErr != nil {

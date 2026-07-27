@@ -121,6 +121,7 @@ func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile
 
 			// Start goroutine pair (reader + writer)
 			pc := NewPeerConnection(conn, remoteID)
+			pc.ConfigureTorrent(len(torrent.PieceHashes), torrent.PieceLength, torrent.Length)
 			pc.Start()
 			if !pc.SendInterested() {
 				pc.Close()
@@ -141,10 +142,7 @@ func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile
 					pc.SetBitfield(ParseBitfield(msg.Payload, len(torrent.PieceHashes)))
 				} else if msg.ID == MsgHave && len(msg.Payload) == 4 {
 					idx := binary.BigEndian.Uint32(msg.Payload)
-					bf := pc.Bitfield()
-					if int(idx) < len(bf) {
-						bf[idx] = true
-					}
+					pc.MarkPieceAvailable(idx)
 				}
 			case <-time.After(10 * time.Second):
 				// No bitfield is valid; continue and learn availability from Have.
