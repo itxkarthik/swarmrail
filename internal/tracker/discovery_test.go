@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/bencode"
+	"github.com/itxkarthik/swarmrail/internal/bencode"
 )
 
 func TestDiscoverPeersAnnouncesConcurrentlyAndDeduplicates(t *testing.T) {

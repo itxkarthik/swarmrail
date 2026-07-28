@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
-	"github.com/itxkarthik/GoTorrent/internal/tracker"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/tracker"
 )
 
-const peerIDPrefix = "-GT0001-"
+const peerIDPrefix = "-SR0001-"
 
 // ConnectFailure records where an outbound peer connection failed.
 type ConnectFailure struct {
@@ -30,10 +30,10 @@ type ConnectReport struct {
 	Failures   []ConnectFailure
 }
 
-// GeneratePeerID creates a 20-byte BitTorrent peer ID with GoTorrent's client prefix.
+// GeneratePeerID creates a 20-byte BitTorrent peer ID with SwarmRail's client prefix.
 func GeneratePeerID() [20]byte {
 	var id [20]byte
-	copy(id[:], peerIDPrefix) // 8 bytes: "-GT0001-"
+	copy(id[:], peerIDPrefix) // 8 bytes: "-SR0001-"
 
 	// Fill remaining 12 bytes with random printable chars
 	var buf [12]byte

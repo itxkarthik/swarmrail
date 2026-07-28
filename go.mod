@@ -1,4 +1,4 @@
-module github.com/itxkarthik/GoTorrent
+module github.com/itxkarthik/swarmrail
 
 go 1.25.6
 

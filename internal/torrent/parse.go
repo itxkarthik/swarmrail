@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/itxkarthik/GoTorrent/internal/bencode"
+	"github.com/itxkarthik/swarmrail/internal/bencode"
 )
 
 // FileEntry represents a single file in a multi-file torrent.

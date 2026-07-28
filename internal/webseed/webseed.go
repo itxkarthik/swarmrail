@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
 const requestTimeout = 30 * time.Second

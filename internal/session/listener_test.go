@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/peer"
-	"github.com/itxkarthik/GoTorrent/internal/piece"
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/piece"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
 func TestPeerListenerAcceptsInboundPeer(t *testing.T) {

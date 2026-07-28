@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
 func TestAnnounceHTTPWithTorrentFile(t *testing.T) {

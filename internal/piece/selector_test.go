@@ -3,7 +3,7 @@ package piece
 import (
 	"testing"
 
-	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/peer"
 )
 
 func makePeerWithBitfield(bitfield []bool) *peer.PeerConnection {

@@ -2,7 +2,7 @@ package tracker
 
 import (
 	"encoding/binary"
-	"github.com/itxkarthik/GoTorrent/internal/bencode"
+	"github.com/itxkarthik/swarmrail/internal/bencode"
 	"net"
 	"net/http"
 	"net/http/httptest"

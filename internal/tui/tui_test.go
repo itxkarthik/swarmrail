@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/piece"
-	"github.com/itxkarthik/GoTorrent/internal/session"
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/piece"
+	"github.com/itxkarthik/swarmrail/internal/session"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"

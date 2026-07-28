@@ -3,7 +3,7 @@ package piece
 import (
 	"math/rand"
 
-	"github.com/itxkarthik/GoTorrent/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/peer"
 )
 
 // RarestPiece selects the piece with the lowest availability among this peer's

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
-	"github.com/itxkarthik/GoTorrent/internal/tracker"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/tracker"
 )
 
 func TestGeneratePeerID_Length(t *testing.T) {
@@ -21,8 +21,8 @@ func TestGeneratePeerID_Length(t *testing.T) {
 func TestGeneratePeerID_Prefix(t *testing.T) {
 	id := GeneratePeerID()
 	prefix := string(id[:8])
-	if prefix != "-GT0001-" {
-		t.Fatalf("expected prefix '-GT0001-', got %q", prefix)
+	if prefix != "-SR0001-" {
+		t.Fatalf("expected prefix '-SR0001-', got %q", prefix)
 	}
 }
 
@@ -187,7 +187,7 @@ func TestConnectToPeersWithIDUsesAnnouncedPeerID(t *testing.T) {
 	var infoHash [20]byte
 	copy(infoHash[:], []byte("testinfohash12345678"))
 	var announcedPeerID [20]byte
-	copy(announcedPeerID[:], []byte("-GT0001-abcdefghijkl"))
+	copy(announcedPeerID[:], []byte("-SR0001-abcdefghijkl"))
 	receivedPeerID := make(chan [20]byte, 1)
 
 	go func() {

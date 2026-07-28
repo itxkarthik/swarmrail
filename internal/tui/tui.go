@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/piece"
-	"github.com/itxkarthik/GoTorrent/internal/session"
+	"github.com/itxkarthik/swarmrail/internal/piece"
+	"github.com/itxkarthik/swarmrail/internal/session"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -260,7 +260,7 @@ func (m Model) renderMain() string {
 	if m.width < 70 {
 		innerWidth = max(20, m.width-2)
 	}
-	header := lipgloss.NewStyle().Foreground(white).Bold(true).MaxWidth(innerWidth).Render("GoTorrent  " + m.m.TorrentName())
+	header := lipgloss.NewStyle().Foreground(white).Bold(true).MaxWidth(innerWidth).Render("SwarmRail  " + m.m.TorrentName())
 	status := lipgloss.NewStyle().Foreground(grayLight).MaxWidth(max(10, innerWidth-3)).Render(m.status())
 	progressLine := m.progress.ViewAs(m.percent) + fmt.Sprintf(" %5.1f%%", m.percent*100)
 	stats := m.renderStats(m.width < 70, innerWidth)

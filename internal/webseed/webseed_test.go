@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
 func TestURLListSingleFileRange(t *testing.T) {

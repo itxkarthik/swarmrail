@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/bencode"
+	"github.com/itxkarthik/swarmrail/internal/bencode"
 )
 
 type Peer struct {

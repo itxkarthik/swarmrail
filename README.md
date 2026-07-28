@@ -1,9 +1,9 @@
-# GoTorrent
+# SwarmRail
 
-GoTorrent is a BitTorrent client written in Go. It implements torrent parsing, tracker announces, peer wire handling, piece scheduling, resume state, and HTTP WebSeed downloads. The TUI uses [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the terminal interface.
+SwarmRail is a BitTorrent client written in Go. It implements torrent parsing, tracker announces, peer wire handling, piece scheduling, resume state, and HTTP WebSeed downloads. The TUI uses [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the terminal interface.
 
-![GoTorrent TUI Peer Connections](.docs/img/image1.png)
-![GoTorrent TUI Webseed Connections](.docs/img/image2.png)
+![SwarmRail TUI Peer Connections](.docs/img/image1.png)
+![SwarmRail TUI Webseed Connections](.docs/img/image2.png)
 
 ## Features
 
@@ -23,7 +23,7 @@ GoTorrent is a BitTorrent client written in Go. It implements torrent parsing, t
 ## Layout
 
 ```text
-cmd/gotorrent/        CLI entrypoint
+cmd/swarmrail/        CLI entrypoint
 internal/bencode/     Bencode encoder and decoder
 internal/torrent/     Torrent metainfo parsing and infohash logic
 internal/tracker/     Concurrent HTTP/UDP announces and peer discovery
@@ -37,23 +37,23 @@ internal/tui/         Bubble Tea UI
 ## Build
 
 ```bash
-go build -o gotorrent ./cmd/gotorrent
+go build -o swarmrail ./cmd/swarmrail
 ```
 
 ## Run
 
 ```bash
 # CLI
-./gotorrent --output /downloads path/to/file.torrent
+./swarmrail --output /downloads path/to/file.torrent
 
 # TUI
-./gotorrent --tui --output /downloads path/to/file.torrent
+./swarmrail --tui --output /downloads path/to/file.torrent
 
 # Custom inbound listen port
-./gotorrent --port 6881 --output /downloads path/to/file.torrent
+./swarmrail --port 6881 --output /downloads path/to/file.torrent
 
 # Let the operating system choose an available listen port
-./gotorrent --port 0 --output /downloads path/to/file.torrent
+./swarmrail --port 0 --output /downloads path/to/file.torrent
 ```
 
 ## Test
@@ -91,15 +91,15 @@ flowchart TD
     M --> N[Completion map and .gtstate]
 ```
 
-Tracker announces return candidate addresses, not guaranteed connections. GoTorrent first announces to every tracker concurrently with a three-second budget. If no peer connects and no WebSeed is available, it performs one ten-second fallback announce, merges and deduplicates both peer sets, and attempts one final connection batch.
+Tracker announces return candidate addresses, not guaranteed connections. SwarmRail first announces to every tracker concurrently with a three-second budget. If no peer connects and no WebSeed is available, it performs one ten-second fallback announce, merges and deduplicates both peer sets, and attempts one final connection batch.
 
-Before announcing, GoTorrent binds the configured TCP listen port and reports the actual bound port to trackers. Inbound handshakes have a fixed deadline and bounded concurrency; connections with the wrong info hash, the local peer ID, or a duplicate peer identity or endpoint are rejected. Accepted inbound peers enter the same piece manager as outbound peers and can join a download that is waiting without any usable startup connection.
+Before announcing, SwarmRail binds the configured TCP listen port and reports the actual bound port to trackers. Inbound handshakes have a fixed deadline and bounded concurrency; connections with the wrong info hash, the local peer ID, or a duplicate peer identity or endpoint are rejected. Accepted inbound peers enter the same piece manager as outbound peers and can join a download that is waiting without any usable startup connection.
 
-During a download, GoTorrent reannounces using the tracker-provided interval. Periodic requests include current verified `downloaded` and `left` values, omit the startup event, and use a ten-second request timeout. Newly returned addresses are deduplicated against previously attempted peers; successful connections are added to the active piece manager without restarting the download. Failed periodic rounds retry after five minutes.
+During a download, SwarmRail reannounces using the tracker-provided interval. Periodic requests include current verified `downloaded` and `left` values, omit the startup event, and use a ten-second request timeout. Newly returned addresses are deduplicated against previously attempted peers; successful connections are added to the active piece manager without restarting the download. Failed periodic rounds retry after five minutes.
 
 In TUI mode, press `r` to request an immediate reannounce. Manual, startup, and periodic attempts share a 60-second cooldown; the status line reports the remaining wait when a request is too early. Press `q` to cancel cleanly and persist verified progress.
 
-Resume state is stored beside the payload as `<torrent-name>.<12-character-infohash>.gtstate`. Every piece marked complete is rehashed from disk before it is trusted, so a stale state file cannot make a missing or corrupt payload appear complete. Legacy `<torrent-name>.gtstate` files are verified and migrated automatically. Separate GoTorrent processes are safe when their torrents resolve to different payload directories, whether or not those directories share a parent; concurrent writes to the same payload directory are unsupported.
+Resume state is stored beside the payload as `<torrent-name>.<12-character-infohash>.gtstate`. Every piece marked complete is rehashed from disk before it is trusted, so a stale state file cannot make a missing or corrupt payload appear complete. Legacy `<torrent-name>.gtstate` files are verified and migrated automatically. Separate SwarmRail processes are safe when their torrents resolve to different payload directories, whether or not those directories share a parent; concurrent writes to the same payload directory are unsupported.
 
 The client uses one peer ID for tracker announces and all handshakes. Once a peer connection starts, one writer goroutine serializes every outbound wire message.
 

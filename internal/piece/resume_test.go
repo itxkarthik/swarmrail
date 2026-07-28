@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
 func TestStateFilePathIncludesShortInfoHash(t *testing.T) {

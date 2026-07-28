@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/peer"
-	"github.com/itxkarthik/GoTorrent/internal/piece"
-	"github.com/itxkarthik/GoTorrent/internal/session"
-	"github.com/itxkarthik/GoTorrent/internal/torrent"
-	"github.com/itxkarthik/GoTorrent/internal/tracker"
-	"github.com/itxkarthik/GoTorrent/internal/tui"
+	"github.com/itxkarthik/swarmrail/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/piece"
+	"github.com/itxkarthik/swarmrail/internal/session"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
+	"github.com/itxkarthik/swarmrail/internal/tracker"
+	"github.com/itxkarthik/swarmrail/internal/tui"
 )
 
 const (
@@ -122,7 +122,7 @@ func run() error {
 	defer stop()
 
 	if flag.NArg() < 1 {
-		return fmt.Errorf("Usage: gotorrent [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
+		return fmt.Errorf("Usage: swarmrail [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
 	}
 	if *port < 0 || *port > 65535 {
 		return fmt.Errorf("invalid listen port %d: must be between 0 and 65535", *port)

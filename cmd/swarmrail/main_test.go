@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itxkarthik/GoTorrent/internal/peer"
-	"github.com/itxkarthik/GoTorrent/internal/tracker"
+	"github.com/itxkarthik/swarmrail/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/tracker"
 )
 
 func TestDiscoverPeerConnectionsRetriesAfterNoUsableConnections(t *testing.T) {
