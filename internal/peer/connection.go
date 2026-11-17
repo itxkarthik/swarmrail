@@ -9,7 +9,18 @@ import (
 	"time"
 )
 
-const defaultTimeout = 30 * time.Second
+const (
+	// writeTimeout bounds a single socket write.
+	writeTimeout = 30 * time.Second
+	// keepAliveInterval is how long the writer may stay silent before it
+	// sends a keep-alive. BEP 3 peers expect one about every two minutes and
+	// commonly drop connections that are silent for longer.
+	keepAliveInterval = 90 * time.Second
+	// idleTimeout is how long the reader waits for any frame, keep-alives
+	// included. A peer that is choking us may legitimately send nothing but
+	// keep-alives, so this must exceed the two-minute keep-alive period.
+	idleTimeout = 3 * time.Minute
+)
 
 // MaxPendingRequests caps the block requests a download worker keeps
 // outstanding on one connection. It also sizes the incoming channel, so the
@@ -39,6 +50,9 @@ type PeerConnection struct {
 	metadataMu    sync.RWMutex
 	bitfieldMu    sync.RWMutex
 	stateChanged  chan struct{} // cap 1; signalled on choke, unchoke, have and bitfield
+
+	keepAliveInterval time.Duration
+	idleTimeout       time.Duration
 
 	// pending holds block requests sent to the remote and not yet answered.
 	// The reader forwards a Piece message only when it matches one of them.
@@ -84,6 +98,9 @@ func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *Pee
 		direction:     direction,
 		stateChanged:  make(chan struct{}, 1),
 		pending:       make(map[PieceWork]struct{}),
+
+		keepAliveInterval: keepAliveInterval,
+		idleTimeout:       idleTimeout,
 	}
 	pc.peerChoking.Store(true) // BEP 3: connections start choked
 	return pc
@@ -102,7 +119,7 @@ func (pc *PeerConnection) reader() {
 	defer pc.Close()
 	seenMessage := false
 	for {
-		if err := pc.conn.SetReadDeadline(time.Now().Add(defaultTimeout)); err != nil {
+		if err := pc.conn.SetReadDeadline(time.Now().Add(pc.idleTimeout)); err != nil {
 			return
 		}
 
@@ -299,7 +316,7 @@ func (pc *PeerConnection) AmInterested() bool { return pc.amInterested.Load() }
 // writer is the only goroutine that writes to the socket, so frames are never
 // interleaved. It never blocks on peer state: a choke only affects which
 // requests the worker queues, never whether Have, Unchoke or piece data can
-// be sent.
+// be sent. It sends a keep-alive after keepAliveInterval without writes.
 func (pc *PeerConnection) writer(first *Message) {
 	defer pc.Close()
 	if first != nil {
@@ -307,8 +324,17 @@ func (pc *PeerConnection) writer(first *Message) {
 			return
 		}
 	}
+	keepAlive := time.NewTimer(pc.keepAliveInterval)
+	defer keepAlive.Stop()
 	for {
+		// Every case below writes, so the silence period restarts each time.
+		keepAlive.Reset(pc.keepAliveInterval)
 		select {
+		case <-keepAlive.C:
+			if err := pc.writeMessage(nil); err != nil {
+				return
+			}
+
 		case req := <-pc.pieceRequests:
 			// Upload: remote peer requested a block from us.
 			data, ok := pc.pieceData(req)
@@ -331,9 +357,14 @@ func (pc *PeerConnection) writer(first *Message) {
 	}
 }
 
-// writeMessage is a helper that sets the write deadline and writes to TCP.
+// writeMessage sets the write deadline and writes one frame. A nil msg is
+// written as a keep-alive.
 func (pc *PeerConnection) writeMessage(msg *Message) error {
-	if err := pc.conn.SetWriteDeadline(time.Now().Add(defaultTimeout)); err != nil {
+	if err := pc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	if msg == nil {
+		_, err := pc.conn.Write(make([]byte, 4)) // zero length prefix
 		return err
 	}
 	if err := WriteMessage(pc.conn, msg); err != nil {

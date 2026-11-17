@@ -485,3 +485,50 @@ func TestSetInterestedSendsOnlyOnChange(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestWriterSendsKeepAliveWhenIdle(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.keepAliveInterval = 50 * time.Millisecond
+	pc.Start(nil)
+	defer pc.Close()
+
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	for range 2 {
+		msg, err := ReadMessage(server)
+		if err != nil {
+			t.Fatalf("no keep-alive from idle writer: %v", err)
+		}
+		if msg != nil {
+			t.Fatalf("got message %d, want keep-alive", msg.ID)
+		}
+	}
+}
+
+func TestReaderToleratesKeepAliveOnlyPeerUntilIdleTimeout(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.idleTimeout = 150 * time.Millisecond
+	pc.keepAliveInterval = time.Hour
+	pc.Start(nil)
+	defer pc.Close()
+
+	// A choking peer that only sends keep-alives stays connected...
+	for range 8 {
+		if _, err := server.Write(make([]byte, 4)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !pc.Active() {
+		t.Fatal("connection closed while the peer was sending keep-alives")
+	}
+	// ...and is dropped once it goes completely silent.
+	select {
+	case <-pc.Done():
+	case <-time.After(time.Second):
+		t.Fatal("silent peer was not dropped after the idle timeout")
+	}
+}
