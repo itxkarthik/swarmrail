@@ -227,9 +227,19 @@ func (m *Manager) Download(parent context.Context, outputPath string, resume boo
 	return nil
 }
 
+// initPeerUpload prepares a connection that has just joined m.peers. It must
+// run after the peer is in m.peers: pieces completed from then on reach it
+// through announceHave, and pieces completed earlier, after its bitfield was
+// captured at connect time, are announced here. Overlap only produces a
+// harmless duplicate Have.
 func (m *Manager) initPeerUpload(p *peer.PeerConnection) {
 	p.ConfigureTorrent(m.totalPieces, int64(m.pieceLength), int64(m.totalLength))
 	p.SetPieceDataHandler(m.readUploadBlock)
+	for i, done := range m.Completed() {
+		if done && !p.AdvertisedHas(i) {
+			p.SendHave(uint32(i))
+		}
+	}
 }
 
 // BitfieldMessage returns our bitfield as the first message to send on a new

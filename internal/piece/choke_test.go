@@ -311,3 +311,29 @@ func TestWorkerRerequestsAfterQuickChokeUnchoke(t *testing.T) {
 	}
 	waitDownload(t, done, dir, tf, payload)
 }
+
+// Pieces completed after a connection's bitfield was captured, but before it
+// joined the manager, must still be announced to it.
+func TestNewPeerIsToldAboutPiecesMissingFromItsBitfield(t *testing.T) {
+	tf := &torrent.TorrentFile{
+		Name: "late.bin", Length: 8, PieceLength: 4,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("aaaa")), sha1.Sum([]byte("bbbb"))},
+	}
+	pc, remote := newScriptedPeer(t, tf) // started with no bitfield
+
+	m := NewManager(tf, []*peer.PeerConnection{pc})
+	m.SetCompleted([]bool{true, false}) // completed after the snapshot
+	startDownload(t, m)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case id := <-remote.control:
+			if id == peer.MsgHave {
+				return
+			}
+		case <-deadline:
+			t.Fatal("peer was never told about piece 0")
+		}
+	}
+}

@@ -55,6 +55,10 @@ type PeerConnection struct {
 	keepAliveInterval time.Duration
 	idleTimeout       time.Duration
 
+	// advertised is the bitfield payload written as the first message, or
+	// nil. It is set before the goroutines start and never changes.
+	advertised []byte
+
 	// pending holds block requests sent to the remote and not yet answered.
 	// The reader forwards a Piece message only when it matches one of them.
 	pendingMu sync.Mutex
@@ -112,6 +116,9 @@ func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *Pee
 // as BEP 3 requires, it is the first message after the handshake. Pass nil
 // when we have no pieces: an all-zero bitfield is optional.
 func (pc *PeerConnection) Start(first *Message) {
+	if first != nil && first.ID == MsgBitfield {
+		pc.advertised = first.Payload
+	}
 	go pc.reader()
 	go pc.writer(first)
 }
@@ -316,6 +323,13 @@ func (pc *PeerConnection) SetInterested(interested bool) {
 	case pc.outgoing <- &Message{ID: id}:
 	case <-pc.ctx.Done():
 	}
+}
+
+// AdvertisedHas reports whether the bitfield sent as the first message
+// included piece index.
+func (pc *PeerConnection) AdvertisedHas(index int) bool {
+	byteIndex := index / 8
+	return index >= 0 && byteIndex < len(pc.advertised) && pc.advertised[byteIndex]&(0x80>>(index%8)) != 0
 }
 
 // AmInterested reports whether we last told the remote we are interested.
