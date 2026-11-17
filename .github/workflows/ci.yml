@@ -37,3 +37,19 @@ jobs:
 
       - name: go test -race
         run: go test -race -count=1 ./...
+
+      # Each fuzz target gets a short run on every change; run them longer
+      # locally with -fuzztime when touching a parser.
+      - name: fuzz
+        run: |
+          set -e
+          for target in \
+            bencode:FuzzDecode \
+            torrent:FuzzParse \
+            peer:FuzzReadMessage \
+            tracker:FuzzParseHTTPResponse \
+            tracker:FuzzParseUDPAnnounce; do
+            pkg="${target%%:*}"
+            name="${target##*:}"
+            go test "./internal/$pkg" -run '^$' -fuzz "^${name}\$" -fuzztime=20s
+          done

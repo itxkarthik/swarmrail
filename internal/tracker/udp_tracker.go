@@ -134,20 +134,34 @@ func (t *udpTracker) announce(ctx context.Context, request AnnounceRequest) (Ann
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("announce: %w", err)
 	}
-	if err := checkAction(resp, ActionAnnounce); err != nil {
+	response, err := parseUDPAnnounce(resp, t.ipv6)
+	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("announce: %w", err)
 	}
+	return response, nil
+}
+
+// parseUDPAnnounce decodes a BEP 15 announce reply whose transaction ID has
+// already been matched. Peers are 18 bytes when the tracker was reached over
+// IPv6, otherwise 6.
+func parseUDPAnnounce(resp []byte, ipv6 bool) (AnnounceResponse, error) {
+	if len(resp) < 8 {
+		return AnnounceResponse{}, fmt.Errorf("%w: %d bytes", errUDPMalformed, len(resp))
+	}
+	if err := checkAction(resp, ActionAnnounce); err != nil {
+		return AnnounceResponse{}, err
+	}
 	if len(resp) < 20 {
-		return AnnounceResponse{}, fmt.Errorf("announce: %w: %d bytes", errUDPMalformed, len(resp))
+		return AnnounceResponse{}, fmt.Errorf("%w: %d bytes", errUDPMalformed, len(resp))
 	}
 
 	peerSize := 6
-	if t.ipv6 {
+	if ipv6 {
 		peerSize = 18
 	}
 	peerBytes := resp[20:]
 	if len(peerBytes)%peerSize != 0 {
-		return AnnounceResponse{}, fmt.Errorf("announce: %w: %d peer bytes is not a multiple of %d", errUDPMalformed, len(peerBytes), peerSize)
+		return AnnounceResponse{}, fmt.Errorf("%w: %d peer bytes is not a multiple of %d", errUDPMalformed, len(peerBytes), peerSize)
 	}
 	peers := make([]Peer, 0, len(peerBytes)/peerSize)
 	for off := 0; off < len(peerBytes); off += peerSize {
