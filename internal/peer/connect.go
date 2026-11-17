@@ -3,7 +3,6 @@ package peer
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -129,21 +128,11 @@ func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile
 				return
 			}
 
-			// Read an optional initial bitfield. BEP 3 peers with no pieces may skip it.
+			// Wait briefly for the peer's initial bitfield or Have. BEP 3 peers
+			// with no pieces may send neither, so a timeout is not an error.
 			pc.SetBitfield(make([]bool, len(torrent.PieceHashes)))
 			select {
-			case msg, ok := <-pc.Incoming():
-				if !ok {
-					pc.Close()
-					recordFailure(addr, "initial message", fmt.Errorf("connection closed"))
-					return
-				}
-				if msg.ID == MsgBitfield {
-					pc.SetBitfield(ParseBitfield(msg.Payload, len(torrent.PieceHashes)))
-				} else if msg.ID == MsgHave && len(msg.Payload) == 4 {
-					idx := binary.BigEndian.Uint32(msg.Payload)
-					pc.MarkPieceAvailable(idx)
-				}
+			case <-pc.StateChanged():
 			case <-time.After(10 * time.Second):
 				// No bitfield is valid; continue and learn availability from Have.
 			case <-pc.Done():

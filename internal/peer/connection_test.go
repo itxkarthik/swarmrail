@@ -72,6 +72,8 @@ func TestPeerConnection_ReaderReceivesMessage(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
+	pc.ConfigureTorrent(50, 16384, 50*16384)
+	pc.SetBitfield(make([]bool, 50))
 	pc.Start()
 	defer pc.Close()
 
@@ -81,17 +83,19 @@ func TestPeerConnection_ReaderReceivesMessage(t *testing.T) {
 		t.Fatalf("WriteMessage error: %v", err)
 	}
 
-	// Read it from the Incoming channel
+	// Have is folded into connection state, not forwarded to Incoming.
+	select {
+	case <-pc.StateChanged():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for state change after Have")
+	}
+	if !pc.Bitfield()[42] {
+		t.Fatal("Have did not mark piece 42 as available")
+	}
 	select {
 	case got := <-pc.Incoming():
-		if got.ID != MsgHave {
-			t.Fatalf("expected MsgHave (4), got %d", got.ID)
-		}
-		if len(got.Payload) != 4 || got.Payload[3] != 42 {
-			t.Fatalf("unexpected payload: %v", got.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message on Incoming channel")
+		t.Fatalf("Have was forwarded to Incoming: %+v", got)
+	default:
 	}
 }
 
@@ -162,14 +166,11 @@ func TestPeerConnection_ReaderHandlesUnchoke(t *testing.T) {
 		t.Fatal("expected to be unchoked")
 	}
 
-	// Verify the message was also delivered on Incoming
+	// The unchoke is signalled as a state change.
 	select {
-	case got := <-pc.Incoming():
-		if got.ID != MsgUnchoke {
-			t.Fatalf("expected MsgUnchoke (1), got %d", got.ID)
-		}
+	case <-pc.StateChanged():
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for unchoke on Incoming channel")
+		t.Fatal("timeout waiting for unchoke state change")
 	}
 }
 
@@ -182,6 +183,7 @@ func TestPeerConnection_ReaderKeepalive(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
+	pc.ConfigureTorrent(2, 16384, 2*16384)
 	pc.Start()
 	defer pc.Close()
 
@@ -199,10 +201,7 @@ func TestPeerConnection_ReaderKeepalive(t *testing.T) {
 	}
 
 	select {
-	case got := <-pc.Incoming():
-		if got.ID != MsgHave {
-			t.Fatalf("expected MsgHave after keep-alive, got %d", got.ID)
-		}
+	case <-pc.StateChanged():
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout — reader likely stalled after keep-alive")
 	}
@@ -351,7 +350,7 @@ func TestPeerConnectionTracksLateBitfieldAndSignalsAvailability(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-pc.AvailabilityChanged():
+	case <-pc.StateChanged():
 	case <-time.After(time.Second):
 		t.Fatal("late bitfield did not signal availability")
 	}
@@ -359,4 +358,40 @@ func TestPeerConnectionTracksLateBitfieldAndSignalsAvailability(t *testing.T) {
 		t.Fatalf("bitfield = %v, want [true false]", bits)
 	}
 	pc.Close()
+}
+
+// An idle worker never reads Incoming. Before the fix, the reader forwarded
+// every Have to Incoming, blocked once its 100-slot buffer filled, and then
+// stopped reading upload requests too.
+func TestReaderKeepsServingRequestsAfterManyHaves(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	const pieces = 300
+	pc := NewInboundPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(pieces, 4, pieces*4)
+	pc.SetBitfield(make([]bool, pieces))
+	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return []byte("data"), true })
+	pc.Start()
+	defer pc.Close()
+
+	go func() {
+		for i := range uint32(200) {
+			if err := WriteMessage(server, BuildHave(i)); err != nil {
+				return
+			}
+		}
+		_ = WriteMessage(server, BuildRequest(0, 0, 4))
+	}()
+
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msg, err := ReadMessage(server)
+	if err != nil {
+		t.Fatalf("no reply to request after 200 Have messages: %v", err)
+	}
+	if msg.ID != MsgPiece {
+		t.Fatalf("reply ID = %d, want piece", msg.ID)
+	}
+	if got := pc.Bitfield(); !got[0] || !got[199] || got[200] {
+		t.Fatal("Have messages were not applied to the bitfield")
+	}
 }

@@ -19,7 +19,7 @@ type PeerConnection struct {
 	peerID        [20]byte
 	choked        atomic.Bool
 	bitfield      []bool
-	incoming      chan *Message  // reader -> manager (wire messages except requests)
+	incoming      chan *Message  // reader -> download worker (piece messages only)
 	pieceQueue    chan PieceWork // manager -> writer (download requests to send)
 	pieceRequests chan PieceWork // reader -> writer (upload requests from remote peer)
 	outgoing      chan *Message  // manager/reader -> writer (control messages: unchoke, have, bitfield)
@@ -33,7 +33,7 @@ type PeerConnection struct {
 	totalLength   int64
 	metadataMu    sync.RWMutex
 	bitfieldMu    sync.RWMutex
-	availability  chan struct{}
+	stateChanged  chan struct{} // cap 1; signalled on choke, unchoke, have and bitfield
 
 	// Choked wait: writer parks here when choked, reader signals on unchoke
 	unchokeMu   sync.Mutex
@@ -77,7 +77,7 @@ func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *Pee
 		ctx:           ctx,
 		cancel:        cancel,
 		direction:     direction,
-		availability:  make(chan struct{}, 1),
+		stateChanged:  make(chan struct{}, 1),
 	}
 	pc.choked.Store(true)
 	pc.unchokeCond = sync.NewCond(&pc.unchokeMu)
@@ -110,14 +110,21 @@ func (pc *PeerConnection) reader() {
 			return
 		}
 
-		// Handle messages that need routing before the generic incoming channel.
+		// Fold protocol state into the connection here and forward only the
+		// messages a download worker consumes. Anything else on the incoming
+		// channel would sit there while the worker is idle, fill the buffer
+		// and block this goroutine, which would also stop uploads.
 		switch msg.ID {
 		case MsgChoke:
 			pc.choked.Store(true)
+			pc.signalStateChange()
+			continue
 		case MsgUnchoke:
 			pc.choked.Store(false)
 			// Wake the writer so it can resume sending requests.
 			pc.unchokeCond.Broadcast()
+			pc.signalStateChange()
+			continue
 		case MsgRequest:
 			// Remote peer wants a piece from us — route to upload handler.
 			if len(msg.Payload) >= 12 {
@@ -143,12 +150,16 @@ func (pc *PeerConnection) reader() {
 			continue
 		case MsgBitfield:
 			pc.SetBitfield(ParseBitfield(msg.Payload, totalPieces))
-			pc.signalAvailability()
+			pc.signalStateChange()
+			continue
 		case MsgHave:
 			pc.MarkPieceAvailable(binary.BigEndian.Uint32(msg.Payload))
+			continue
+		case MsgPiece:
+		default:
+			continue // cancel and unsupported extension messages
 		}
 
-		// Route all other messages (piece, have, bitfield, etc.) to incoming.
 		select {
 		case pc.incoming <- msg:
 		case <-pc.ctx.Done():
@@ -339,17 +350,20 @@ func (pc *PeerConnection) MarkPieceAvailable(index uint32) {
 	if int(index) < len(pc.bitfield) {
 		pc.bitfield[index] = true
 	}
-	pc.signalAvailability()
+	pc.signalStateChange()
 }
 
-func (pc *PeerConnection) signalAvailability() {
+func (pc *PeerConnection) signalStateChange() {
 	select {
-	case pc.availability <- struct{}{}:
+	case pc.stateChanged <- struct{}{}:
 	default:
 	}
 }
 
-func (pc *PeerConnection) AvailabilityChanged() <-chan struct{} { return pc.availability }
+// StateChanged is signalled when the remote chokes or unchokes us or
+// announces new pieces. It has a buffer of one, so a burst of changes
+// produces a single wake-up; callers re-read the state after waking.
+func (pc *PeerConnection) StateChanged() <-chan struct{} { return pc.stateChanged }
 
 // ConfigureTorrent enables semantic validation of peer bitfields and requests.
 func (pc *PeerConnection) ConfigureTorrent(totalPieces int, pieceLength, totalLength int64) {
@@ -371,7 +385,7 @@ func (pc *PeerConnection) PeerID() [20]byte      { return pc.peerID }
 func (pc *PeerConnection) UploadedBytes() uint64 { return pc.uploaded.Load() }
 func (pc *PeerConnection) Active() bool          { return pc.ctx.Err() == nil }
 
-// Incoming returns the read-only channel of messages from this peer.
+// Incoming returns the piece messages received from this peer.
 func (pc *PeerConnection) Incoming() <-chan *Message {
 	return pc.incoming
 }

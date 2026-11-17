@@ -290,7 +290,7 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 				return
 			case <-p.Done():
 				return
-			case <-p.AvailabilityChanged():
+			case <-p.StateChanged():
 				continue
 			}
 		}
