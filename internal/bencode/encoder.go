@@ -4,60 +4,80 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
+	"strconv"
 )
 
+// MarshalValue writes the canonical bencoding of v to w.
+//
+// Supported types are int, int64, string, []byte, []any and map[string]any.
+// Dictionary keys are emitted sorted by their raw bytes, as BEP 3 requires, so
+// the same value always encodes to the same bytes.
 func MarshalValue(w io.Writer, v any) error {
-	switch v := v.(type) {
-	case int:
-		_, err := fmt.Fprintf(w, "i%de", v)
+	buf, err := appendValue(nil, v)
+	if err != nil {
 		return err
-	case int64:
-		_, err := fmt.Fprintf(w, "i%de", v)
-		return err
-	case string:
-		_, err := fmt.Fprintf(w, "%d:%s", len(v), v)
-		return err
-	case []byte:
-		_, err := fmt.Fprintf(w, "%d:", len(v))
-		if err != nil {
-			return err
-		}
-		_, err = w.Write(v)
-		return err
-	case []any:
-		if _, err := fmt.Fprint(w, "l"); err != nil {
-			return err
-		}
-		for _, item := range v {
-			if err := MarshalValue(w, item); err != nil {
-				return err
-			}
-		}
-		_, err := fmt.Fprint(w, "e")
-		return err
-	case map[string]any:
-		if _, err := fmt.Fprint(w, "d"); err != nil {
-			return err
-		}
-		for k, item := range v {
-			if err := MarshalValue(w, k); err != nil {
-				return err
-			}
-			if err := MarshalValue(w, item); err != nil {
-				return err
-			}
-		}
-		_, err := fmt.Fprint(w, "e")
-		return err
-	default:
-		return fmt.Errorf("unsupported type: %T", v)
 	}
+	_, err = w.Write(buf)
+	return err
 }
 
+// Marshal returns the canonical bencoding of v.
 func Marshal(v any) ([]byte, error) {
-	buf := bytes.Buffer{}
+	var buf bytes.Buffer
 	if err := MarshalValue(&buf, v); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func appendValue(dst []byte, v any) ([]byte, error) {
+	switch v := v.(type) {
+	case int:
+		return appendInt(dst, int64(v)), nil
+	case int64:
+		return appendInt(dst, v), nil
+	case string:
+		return appendString(dst, v), nil
+	case []byte:
+		dst = strconv.AppendInt(dst, int64(len(v)), 10)
+		dst = append(dst, ':')
+		return append(dst, v...), nil
+	case []any:
+		dst = append(dst, 'l')
+		for _, item := range v {
+			var err error
+			if dst, err = appendValue(dst, item); err != nil {
+				return nil, err
+			}
+		}
+		return append(dst, 'e'), nil
+	case map[string]any:
+		dst = append(dst, 'd')
+		// Go string comparison is bytewise, which matches BEP 3's
+		// "sorted as raw strings" rule.
+		for _, key := range slices.Sorted(maps.Keys(v)) {
+			dst = appendString(dst, key)
+			var err error
+			if dst, err = appendValue(dst, v[key]); err != nil {
+				return nil, err
+			}
+		}
+		return append(dst, 'e'), nil
+	default:
+		return nil, fmt.Errorf("bencode: unsupported type %T", v)
+	}
+}
+
+func appendInt(dst []byte, n int64) []byte {
+	dst = append(dst, 'i')
+	dst = strconv.AppendInt(dst, n, 10)
+	return append(dst, 'e')
+}
+
+func appendString(dst []byte, s string) []byte {
+	dst = strconv.AppendInt(dst, int64(len(s)), 10)
+	dst = append(dst, ':')
+	return append(dst, s...)
 }
