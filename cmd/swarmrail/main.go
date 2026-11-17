@@ -333,6 +333,11 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 	m.SetStatus("Connecting trackers...")
 
 	go func() {
+		// Report the result only after every deferred cleanup below (the
+		// stopped announce, closing peers, stopping reannounce) has run, so
+		// the process cannot exit before shutdown finishes.
+		var downloadErr error
+		defer func() { workerResult <- downloadErr }()
 		var (
 			peers           []tracker.Peer
 			connections     []*peer.PeerConnection
@@ -422,8 +427,8 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 			}
 			piece.RemoveResume(statePath)
 		}
+		downloadErr = err
 		doneCh <- err
-		workerResult <- err
 	}()
 
 	tuiErr := tui.Run(m, doneCh, controller, cancel, peerListener)
