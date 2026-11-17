@@ -1,26 +1,22 @@
 package piece
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/itxkarthik/swarmrail/internal/torrent"
 )
 
-// PieceWriter handles writing completed pieces to the output file(s).
-// Supports both single-file and multi-file torrents.
+// PieceWriter reads and writes piece data in the output file(s). Single-file
+// torrents are treated as a file list with one entry, so both layouts share
+// the same offset mapping.
 type PieceWriter struct {
 	pieceLen int64
-
-	// Single-file mode
-	file *os.File
-
-	// Multi-file mode
-	isMulti     bool
-	entries     []torrent.FileEntry
-	fileOffsets []int64 // cumulative byte offset of each file's start
-	files       []*os.File
+	lengths  []int64    // length of each file, in torrent order
+	files    []*os.File // open handle for each entry in lengths
 }
 
 // NewPieceWriter creates a PieceWriter for the given torrent.
@@ -36,163 +32,111 @@ func NewPieceWriter(outputPath string, tf *torrent.TorrentFile, resume bool) (*P
 	// Always use O_RDWR so the writer can also serve uploaded pieces.
 	openFlags := os.O_CREATE | os.O_RDWR | os.O_TRUNC
 	if resume {
-		// Preserve existing data for completed pieces, no truncation
 		openFlags = os.O_CREATE | os.O_RDWR
 	}
 
+	type target struct {
+		path   string
+		length int64
+	}
+	var targets []target
 	if len(tf.Files) == 0 {
-		// Single-file mode
-		fullPath := filepath.Join(outputPath, tf.Name)
-		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("creating output directory: %w", err)
+		targets = []target{{filepath.Join(outputPath, tf.Name), tf.Length}}
+	} else {
+		baseDir := filepath.Join(outputPath, tf.Name)
+		for _, entry := range tf.Files {
+			targets = append(targets, target{filepath.Join(append([]string{baseDir}, entry.Path...)...), entry.Length})
 		}
-		f, err := os.OpenFile(fullPath, openFlags, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("opening output file %s: %w", fullPath, err)
-		}
-		if resume {
-			// Pre-allocate to the full torrent size so WriteAt works at any offset
-			_ = f.Truncate(tf.Length)
-		}
-		return &PieceWriter{
-			pieceLen: tf.PieceLength,
-			file:     f,
-		}, nil
 	}
 
-	// Multi-file mode
-	baseDir := filepath.Join(outputPath, tf.Name)
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, fmt.Errorf("creating output directory: %w", err)
+	pw := &PieceWriter{
+		pieceLen: tf.PieceLength,
+		lengths:  make([]int64, 0, len(targets)),
+		files:    make([]*os.File, 0, len(targets)),
 	}
-
-	// Pre-compute cumulative offsets and open all files
-	offsets := make([]int64, len(tf.Files))
-	files := make([]*os.File, len(tf.Files))
-	var cumulative int64
-	for i, entry := range tf.Files {
-		offsets[i] = cumulative
-		cumulative += entry.Length
-
-		fullPath := filepath.Join(append([]string{baseDir}, entry.Path...)...)
-		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			// Close any files already opened
-			for j := range files[:i] {
-				files[j].Close()
-			}
+	for _, t := range targets {
+		dir := filepath.Dir(t.path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			pw.Close()
 			return nil, fmt.Errorf("creating directory %s: %w", dir, err)
 		}
-		f, err := os.OpenFile(fullPath, openFlags, 0644)
+		f, err := os.OpenFile(t.path, openFlags, 0o644)
 		if err != nil {
-			for j := range files[:i] {
-				files[j].Close()
-			}
-			return nil, fmt.Errorf("opening file %s: %w", fullPath, err)
+			pw.Close()
+			return nil, fmt.Errorf("opening file %s: %w", t.path, err)
 		}
 		if resume {
-			_ = f.Truncate(entry.Length)
+			// Pre-allocate to the full size so WriteAt works at any offset.
+			_ = f.Truncate(t.length)
 		}
-		files[i] = f
+		pw.files = append(pw.files, f)
+		pw.lengths = append(pw.lengths, t.length)
 	}
-
-	return &PieceWriter{
-		pieceLen:    tf.PieceLength,
-		isMulti:     true,
-		entries:     tf.Files,
-		fileOffsets: offsets,
-		files:       files,
-	}, nil
+	return pw, nil
 }
 
-// WritePiece writes a completed piece's data at its byte offset in the output.
-// For single-file torrents: writes to the single output file via WriteAt.
-// For multi-file torrents: splits the piece across the correct files.
+// WritePiece writes a verified piece at its byte offset in the output.
 func (pw *PieceWriter) WritePiece(index uint32, data []byte) error {
-	pieceOffset := int64(index) * pw.pieceLen
-	pieceEnd := pieceOffset + int64(len(data))
-
-	if pw.file != nil {
-		// Single-file: direct WriteAt
-		_, err := pw.file.WriteAt(data, pieceOffset)
-		return err
-	}
-
-	// Multi-file: find overlapping files and write appropriate byte ranges
-	for i := range pw.entries {
-		fileStart := pw.fileOffsets[i]
-		fileEnd := fileStart + pw.entries[i].Length
-
-		overlapStart := max(pieceOffset, fileStart)
-		overlapEnd := min(pieceEnd, fileEnd)
-
-		if overlapStart >= overlapEnd {
-			continue
-		}
-
-		// Offset within the file
-		writeAt := overlapStart - fileStart
-		// Byte range within `data` to write
-		dataStart := overlapStart - pieceOffset
-		dataLen := overlapEnd - overlapStart
-
-		if _, err := pw.files[i].WriteAt(data[dataStart:dataStart+dataLen], writeAt); err != nil {
-			return fmt.Errorf("writing piece %d to file %d: %w", index, i, err)
-		}
+	if err := pw.writeAt(data, int64(index)*pw.pieceLen); err != nil {
+		return fmt.Errorf("writing piece %d: %w", index, err)
 	}
 	return nil
 }
 
-// ReadPiece reads a completed piece's data from the output file(s) at the
-// given piece index. This is the inverse of WritePiece — it reads from the
-// on-disk file(s) to serve upload requests from other peers.
-// The data slice must have the correct length for the piece.
+// ReadPiece reads len(data) bytes from the start of piece index.
 func (pw *PieceWriter) ReadPiece(index uint32, data []byte) (int, error) {
-	pieceOffset := int64(index) * pw.pieceLen
-	pieceEnd := pieceOffset + int64(len(data))
+	return pw.ReadBlock(index, 0, data)
+}
 
-	if pw.file != nil {
-		return pw.file.ReadAt(data, pieceOffset)
-	}
+// ReadBlock reads len(data) bytes starting begin bytes into piece index. It
+// serves BEP 3 upload requests, which address a block by piece index and an
+// offset within that piece.
+func (pw *PieceWriter) ReadBlock(index, begin uint32, data []byte) (int, error) {
+	return pw.readAt(data, int64(index)*pw.pieceLen+int64(begin))
+}
 
-	// Multi-file: read from overlapping files
+// readAt fills p from the torrent-global offset off. It returns
+// io.ErrUnexpectedEOF if the range runs past the end of the payload.
+func (pw *PieceWriter) readAt(p []byte, off int64) (int, error) {
 	total := 0
-	for i := range pw.entries {
-		fileStart := pw.fileOffsets[i]
-		fileEnd := fileStart + pw.entries[i].Length
-
-		overlapStart := max(pieceOffset, fileStart)
-		overlapEnd := min(pieceEnd, fileEnd)
-
-		if overlapStart >= overlapEnd {
-			continue
-		}
-
-		readAt := overlapStart - fileStart
-		dataStart := overlapStart - pieceOffset
-		dataLen := overlapEnd - overlapStart
-
-		n, err := pw.files[i].ReadAt(data[dataStart:dataStart+dataLen], readAt)
+	for _, s := range fileSpans(pw.lengths, off, int64(len(p))) {
+		n, err := pw.files[s.file].ReadAt(p[s.bufOff:s.bufOff+s.length], s.fileOff)
 		total += n
-		if err != nil {
-			return total, err
+		if int64(n) == s.length {
+			continue // a full read may still report io.EOF at the end of a file
 		}
+		if err == nil || errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return total, err
+	}
+	if total != len(p) {
+		return total, io.ErrUnexpectedEOF
 	}
 	return total, nil
 }
 
-// Close closes all open files.
-func (pw *PieceWriter) Close() error {
-	if pw.file != nil {
-		return pw.file.Close()
+// writeAt writes p at the torrent-global offset off.
+func (pw *PieceWriter) writeAt(p []byte, off int64) error {
+	written := int64(0)
+	for _, s := range fileSpans(pw.lengths, off, int64(len(p))) {
+		if _, err := pw.files[s.file].WriteAt(p[s.bufOff:s.bufOff+s.length], s.fileOff); err != nil {
+			return fmt.Errorf("file %d: %w", s.file, err)
+		}
+		written += s.length
 	}
+	if written != int64(len(p)) {
+		return fmt.Errorf("range %d+%d is outside the torrent payload", off, len(p))
+	}
+	return nil
+}
+
+// Close closes all open files and returns the first error.
+func (pw *PieceWriter) Close() error {
 	var firstErr error
 	for _, f := range pw.files {
-		if f != nil {
-			if err := f.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr

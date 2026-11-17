@@ -3,6 +3,7 @@ package piece
 import (
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -146,54 +147,46 @@ func readPayloadPiece(outputPath string, tf *torrent.TorrentFile, index int) ([]
 	if length <= 0 {
 		return nil, io.ErrUnexpectedEOF
 	}
-	data := make([]byte, length)
-	if len(tf.Files) == 0 {
-		file, err := os.Open(filepath.Join(outputPath, tf.Name))
-		if err != nil {
-			return nil, err
+
+	paths := []string{filepath.Join(outputPath, tf.Name)}
+	lengths := []int64{tf.Length}
+	if len(tf.Files) > 0 {
+		paths, lengths = paths[:0], lengths[:0]
+		for _, entry := range tf.Files {
+			paths = append(paths, filepath.Join(append([]string{outputPath, tf.Name}, entry.Path...)...))
+			lengths = append(lengths, entry.Length)
 		}
-		defer file.Close()
-		n, err := file.ReadAt(data, start)
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-		if int64(n) != length {
-			return nil, io.ErrUnexpectedEOF
-		}
-		return data, nil
 	}
 
-	var torrentOffset int64
-	written := int64(0)
-	for _, entry := range tf.Files {
-		fileStart := torrentOffset
-		fileEnd := fileStart + entry.Length
-		torrentOffset = fileEnd
-		overlapStart := max(start, fileStart)
-		overlapEnd := min(start+length, fileEnd)
-		if overlapStart >= overlapEnd {
-			continue
-		}
-		path := filepath.Join(append([]string{outputPath, tf.Name}, entry.Path...)...)
-		file, err := os.Open(path)
-		if err != nil {
+	data := make([]byte, length)
+	read := int64(0)
+	for _, s := range fileSpans(lengths, start, length) {
+		if err := readFileRange(paths[s.file], data[s.bufOff:s.bufOff+s.length], s.fileOff); err != nil {
 			return nil, err
 		}
-		partLength := overlapEnd - overlapStart
-		n, readErr := file.ReadAt(data[written:written+partLength], overlapStart-fileStart)
-		file.Close()
-		if readErr != nil && readErr != io.EOF {
-			return nil, readErr
-		}
-		if int64(n) != partLength {
-			return nil, io.ErrUnexpectedEOF
-		}
-		written += partLength
+		read += s.length
 	}
-	if written != length {
+	if read != length {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return data, nil
+}
+
+// readFileRange fills p from path at off, failing if the file is too short.
+func readFileRange(path string, p []byte, off int64) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	n, err := file.ReadAt(p, off)
+	if n == len(p) {
+		return nil
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // RemoveResume deletes the state file after a successful download.

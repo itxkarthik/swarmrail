@@ -245,7 +245,7 @@ func (m *Manager) readUploadBlock(work peer.PieceWork) ([]byte, bool) {
 		return nil, false
 	}
 	data := make([]byte, work.Length)
-	n, err := pw.ReadPiece(uint32(work.Index), data)
+	n, err := pw.ReadBlock(uint32(work.Index), uint32(work.Begin), data)
 	return data, err == nil && n == len(data)
 }
 
