@@ -134,7 +134,7 @@ func parseHTTPResponse(body []byte) (AnnounceResponse, error) {
 		return AnnounceResponse{}, fmt.Errorf("invalid tracker response: expected dict")
 	}
 	if failure, ok := top["failure reason"].(string); ok {
-		return AnnounceResponse{}, fmt.Errorf("tracker failure: %s", failure)
+		return AnnounceResponse{}, fmt.Errorf("tracker failure: %s", sanitizeTrackerText([]byte(failure)))
 	}
 
 	// Check for peers in the response

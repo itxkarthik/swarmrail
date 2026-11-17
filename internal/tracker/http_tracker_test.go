@@ -88,3 +88,10 @@ func TestHTTPAnnounceInfoHashRoundTripsThroughServer(t *testing.T) {
 		t.Fatalf("key = %q, want 8 hex digits", gotKey)
 	}
 }
+
+func TestHTTPFailureReasonIsQuoted(t *testing.T) {
+	_, err := parseHTTPResponse([]byte("d14:failure reason9:bad\x1b[2Jxxe"))
+	if err == nil || strings.Contains(err.Error(), "\x1b") {
+		t.Fatalf("error = %q, want the failure reason with control characters escaped", err)
+	}
+}
