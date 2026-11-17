@@ -303,3 +303,29 @@ func TestRarestPiece_SelectsFromThisPeerOnly(t *testing.T) {
 		t.Fatalf("expected peer1 to get piece 1 or 2, got %d", idx)
 	}
 }
+
+// BenchmarkRarestPiece uses the shape of a 4 GB torrent (15,566 pieces of
+// 256 KiB) with ten seeds, where selection used to allocate quadratically.
+func BenchmarkRarestPiece(b *testing.B) {
+	const pieces = 15566
+	full := make([]bool, pieces)
+	for i := range full {
+		full[i] = true
+	}
+	peers := make([]*peer.PeerConnection, 10)
+	for i := range peers {
+		peers[i] = makePeerWithBitfield(full)
+	}
+	m := &Manager{
+		totalPieces: pieces,
+		peers:       peers,
+		completed:   make([]bool, pieces),
+		inProgress:  make(map[uint32]bool),
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if m.RarestPiece(peers[0]) < 0 {
+			b.Fatal("no piece selected")
+		}
+	}
+}

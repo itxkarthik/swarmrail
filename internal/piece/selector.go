@@ -13,6 +13,10 @@ func (m *Manager) RarestPiece(p *peer.PeerConnection) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Copy the peer's bitfield once: Bitfield returns a fresh copy, so
+	// calling it per piece made selection quadratic in the piece count.
+	mine := p.Bitfield()
+
 	// Count availability across all connected peers.
 	availability := make([]int, m.totalPieces)
 	for _, peer := range m.peers {
@@ -30,8 +34,7 @@ func (m *Manager) RarestPiece(p *peer.PeerConnection) int {
 		if m.completed[i] || m.inProgress[uint32(i)] {
 			continue
 		}
-		bf := p.Bitfield()
-		if i >= len(bf) || !bf[i] {
+		if i >= len(mine) || !mine[i] {
 			continue
 		}
 		if availability[i] < rarestCount {
@@ -49,8 +52,7 @@ func (m *Manager) RarestPiece(p *peer.PeerConnection) int {
 		if m.completed[i] || m.inProgress[uint32(i)] {
 			continue
 		}
-		bf := p.Bitfield()
-		if i >= len(bf) || !bf[i] {
+		if i >= len(mine) || !mine[i] {
 			continue
 		}
 		if availability[i] == rarestCount {
