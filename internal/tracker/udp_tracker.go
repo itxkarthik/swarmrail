@@ -3,24 +3,16 @@ package tracker
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type UDPTracker struct {
-	conn                *net.UDPConn
-	transactionID       uint32
-	connectionID        uint64
-	connectionCreatedAt time.Time
-	addr                *net.UDPAddr
-	started             bool
-}
-
-// Actions
+// BEP 15 actions.
 const (
 	ActionConnect  = 0
 	ActionAnnounce = 1
@@ -28,283 +20,230 @@ const (
 	ActionError    = 3
 )
 
-// Magic connection ID for UDP tracker
+// MagicConnectionID is the protocol_id sent in every BEP 15 connect request.
 const MagicConnectionID uint64 = 0x41727101980
 
-type ConnectionResponse struct {
-	action        uint32
-	transactionID uint32
-	connectionID  uint64
+const (
+	// udpBaseTimeout is the first retransmission timeout; each retry doubles
+	// it. BEP 15 suggests 15 s, but announces here run inside a startup
+	// budget of a few seconds, so a shorter first timeout is the only way a
+	// lost packet can be retried at all. The caller's context still bounds
+	// the whole exchange.
+	udpBaseTimeout = 2 * time.Second
+	// udpMaxAttempts caps transmissions of one request (BEP 15 allows up to
+	// nine). With doubling this spans 2+4+8+16 = 30 s.
+	udpMaxAttempts = 4
+	// udpConnectionLifetime is how long a connection ID may be reused.
+	// BEP 15 allows one minute; renew a little early.
+	udpConnectionLifetime = 55 * time.Second
+	// udpMaxDatagram is large enough for any UDP payload, so replies with
+	// many peers are never truncated.
+	udpMaxDatagram = 64 << 10
+	// maxTrackerMessage bounds tracker-supplied text shown to the user.
+	maxTrackerMessage = 256
+)
+
+var (
+	errUDPTimeout   = errors.New("udp tracker did not respond")
+	errUDPMalformed = errors.New("malformed udp tracker response")
+)
+
+// sessionKey identifies this client to trackers for the whole process, so a
+// tracker can recognise us after an IP address change (BEP 15 "key").
+var sessionKey = rand.Uint32()
+
+// udpTracker speaks BEP 15 to one tracker over a connected UDP socket, which
+// makes the kernel discard datagrams from any other address.
+type udpTracker struct {
+	conn         *net.UDPConn
+	ipv6         bool // peers are 18 bytes when the tracker is reached over IPv6
+	connectionID uint64
+	connectedAt  time.Time
+	baseTimeout  time.Duration
 }
 
-type udpAnnounceResponse struct {
-	action        uint32
-	transactionID uint32
-	interval      uint32
-	leechers      uint32
-	seeders       uint32
-	peers         []Peer
-}
-
-// Connect to the UDP tracker and return the connection ID
-func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
-	return t.ConnectContext(context.Background(), addr)
-}
-
-// ConnectContext opens a BEP 15 connection that can be cancelled by ctx.
-func (t *UDPTracker) ConnectContext(ctx context.Context, addr *net.UDPAddr) (uint64, error) {
-	// Generate a random transaction ID
-	t.transactionID = rand.Uint32()
-
-	// Pack connection request: connID(8) + action(4) + transactionID(4)
-	buf := make([]byte, 16)
-	binary.BigEndian.PutUint64(buf[0:8], MagicConnectionID)
-	binary.BigEndian.PutUint32(buf[8:12], uint32(ActionConnect))
-	binary.BigEndian.PutUint32(buf[12:16], uint32(t.transactionID))
-
-	// Send via net.DialUDP
+func dialUDPTracker(addr *net.UDPAddr) (*udpTracker, error) {
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	success := false
-	defer func() {
-		if !success {
-			conn.Close()
+	return &udpTracker{
+		conn:        conn,
+		ipv6:        addr.IP.To4() == nil,
+		baseTimeout: udpBaseTimeout,
+	}, nil
+}
+
+func (t *udpTracker) Close() error { return t.conn.Close() }
+
+// connect obtains a connection ID unless the current one is still valid.
+func (t *udpTracker) connect(ctx context.Context) error {
+	if t.connectionID != 0 && time.Since(t.connectedAt) < udpConnectionLifetime {
+		return nil
+	}
+	txID := rand.Uint32()
+	req := make([]byte, 16)
+	binary.BigEndian.PutUint64(req[0:8], MagicConnectionID)
+	binary.BigEndian.PutUint32(req[8:12], ActionConnect)
+	binary.BigEndian.PutUint32(req[12:16], txID)
+
+	resp, err := t.roundTrip(ctx, req, txID)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	if err := checkAction(resp, ActionConnect); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	if len(resp) < 16 {
+		return fmt.Errorf("connect: %w: %d bytes", errUDPMalformed, len(resp))
+	}
+	t.connectionID = binary.BigEndian.Uint64(resp[8:16])
+	t.connectedAt = time.Now()
+	return nil
+}
+
+// announce sends a BEP 15 announce and parses the reply.
+func (t *udpTracker) announce(ctx context.Context, request AnnounceRequest) (AnnounceResponse, error) {
+	if err := t.connect(ctx); err != nil {
+		return AnnounceResponse{}, err
+	}
+
+	txID := rand.Uint32()
+	key := request.Key
+	if key == 0 {
+		key = sessionKey
+	}
+	// connection_id(8) action(4) transaction_id(4) info_hash(20) peer_id(20)
+	// downloaded(8) left(8) uploaded(8) event(4) ip(4) key(4) num_want(4) port(2)
+	req := make([]byte, 98)
+	binary.BigEndian.PutUint64(req[0:8], t.connectionID)
+	binary.BigEndian.PutUint32(req[8:12], ActionAnnounce)
+	binary.BigEndian.PutUint32(req[12:16], txID)
+	copy(req[16:36], request.InfoHash[:])
+	copy(req[36:56], request.PeerID[:])
+	binary.BigEndian.PutUint64(req[56:64], request.Downloaded)
+	binary.BigEndian.PutUint64(req[64:72], request.Left)
+	binary.BigEndian.PutUint64(req[72:80], request.Uploaded)
+	binary.BigEndian.PutUint32(req[80:84], uint32(request.Event))
+	binary.BigEndian.PutUint32(req[84:88], 0) // ip: use the sender address
+	binary.BigEndian.PutUint32(req[88:92], key)
+	binary.BigEndian.PutUint32(req[92:96], 0xFFFFFFFF) // num_want: tracker default
+	binary.BigEndian.PutUint16(req[96:98], request.Port)
+
+	resp, err := t.roundTrip(ctx, req, txID)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("announce: %w", err)
+	}
+	if err := checkAction(resp, ActionAnnounce); err != nil {
+		return AnnounceResponse{}, fmt.Errorf("announce: %w", err)
+	}
+	if len(resp) < 20 {
+		return AnnounceResponse{}, fmt.Errorf("announce: %w: %d bytes", errUDPMalformed, len(resp))
+	}
+
+	peerSize := 6
+	if t.ipv6 {
+		peerSize = 18
+	}
+	peerBytes := resp[20:]
+	if len(peerBytes)%peerSize != 0 {
+		return AnnounceResponse{}, fmt.Errorf("announce: %w: %d peer bytes is not a multiple of %d", errUDPMalformed, len(peerBytes), peerSize)
+	}
+	peers := make([]Peer, 0, len(peerBytes)/peerSize)
+	for off := 0; off < len(peerBytes); off += peerSize {
+		ipLen := peerSize - 2
+		ip := make(net.IP, ipLen) // copy: peerBytes aliases the read buffer
+		copy(ip, peerBytes[off:off+ipLen])
+		port := binary.BigEndian.Uint16(peerBytes[off+ipLen : off+peerSize])
+		if port == 0 {
+			continue
 		}
-	}()
-
-	// Read response (16 bytes) with timeout
-	conn.SetReadDeadline(operationDeadline(ctx, 5*time.Second))
-	_, err = conn.Write(buf)
-	if err != nil {
-		return 0, err
+		peers = append(peers, Peer{IP: ip, Port: port})
 	}
 
-	// Read response
-	buf = make([]byte, 16)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return 0, err
-	}
-	if n != 16 {
-		return 0, fmt.Errorf("expected 16 bytes, got %d", n)
-	}
-
-	action := binary.BigEndian.Uint32(buf[0:4])
-	if action == ActionError {
-		return 0, fmt.Errorf("tracker error: %s", string(buf[8:n]))
-	}
-
-	resp := ConnectionResponse{
-		action:        action,
-		transactionID: binary.BigEndian.Uint32(buf[4:8]),
-		connectionID:  binary.BigEndian.Uint64(buf[8:16]),
-	}
-
-	// validate action == 0, transactionID matches
-	if resp.action != ActionConnect {
-		return 0, fmt.Errorf("expected connect action, got %d", resp.action)
-	}
-	if resp.transactionID != t.transactionID {
-		return 0, fmt.Errorf("transaction ID mismatch")
-	}
-	success = true
-	t.conn = conn
-	t.connectionID = resp.connectionID
-	t.connectionCreatedAt = time.Now()
-	t.addr = addr
-	// Return connection ID
-	return resp.connectionID, nil
-}
-
-// Announce to the UDP tracker and return the peers, number of peers, and any error
-func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, totalLength uint64) ([]Peer, int, error) {
-	return t.AnnounceContext(context.Background(), infoHash, peerID, port, totalLength)
-}
-
-// AnnounceContext performs a BEP 15 announce that can be cancelled by ctx.
-func (t *UDPTracker) AnnounceContext(ctx context.Context, infoHash [20]byte, peerID [20]byte, port uint16, totalLength uint64) ([]Peer, int, error) {
-	event := EventNone
-	if !t.started {
-		event = EventStarted
-		t.started = true
-	}
-	response, err := t.announceRequestContext(ctx, AnnounceRequest{
-		InfoHash: infoHash,
-		PeerID:   peerID,
-		Port:     port,
-		Left:     totalLength,
-		Event:    event,
-	})
-	return response.Peers, int(response.Interval / time.Second), err
-}
-
-func (t *UDPTracker) announceRequestContext(ctx context.Context, request AnnounceRequest) (AnnounceResponse, error) {
-	if t.addr == nil {
-		return AnnounceResponse{}, fmt.Errorf("tracker address not set")
-	}
-	if err := t.EnsureConnectionContext(ctx); err != nil {
-		return AnnounceResponse{}, err
-	}
-
-	// Pack announce request (BEP 15): connID(8) + action(4) + txID(4) + infoHash(20) + peerID(20)
-	// + downloaded(8) + left(8) + uploaded(8) + event(4) + ip_addr(4) + key(4) + num_want(4) + port(2) = 98 bytes
-	buf := make([]byte, 98)
-	binary.BigEndian.PutUint64(buf[0:8], t.connectionID)
-	binary.BigEndian.PutUint32(buf[8:12], uint32(ActionAnnounce))
-	announceTxID := rand.Uint32()
-	binary.BigEndian.PutUint32(buf[12:16], announceTxID)
-	copy(buf[16:36], request.InfoHash[:])
-	copy(buf[36:56], request.PeerID[:])
-	binary.BigEndian.PutUint64(buf[56:64], request.Downloaded)
-	binary.BigEndian.PutUint64(buf[64:72], request.Left)
-	binary.BigEndian.PutUint64(buf[72:80], request.Uploaded)
-	binary.BigEndian.PutUint32(buf[80:84], uint32(request.Event))
-	binary.BigEndian.PutUint32(buf[84:88], 0)             // ip_addr
-	binary.BigEndian.PutUint32(buf[88:92], rand.Uint32()) // key
-	binary.BigEndian.PutUint32(buf[92:96], 0xFFFFFFFF)    // num_want
-	binary.BigEndian.PutUint16(buf[96:98], request.Port)
-
-	// Send announce request
-	_, err := t.conn.Write(buf)
-	if err != nil {
-		return AnnounceResponse{}, err
-	}
-
-	// read response with timeout
-	t.conn.SetReadDeadline(operationDeadline(ctx, 5*time.Second))
-
-	// response: action(4) + transactionID(4) + interval(4) + leechers(4) + seeders(4) + peers(...)
-	buf = make([]byte, 1500)
-	n, err := t.conn.Read(buf)
-	if err != nil {
-		return AnnounceResponse{}, err
-	}
-
-	if n < 20 {
-		return AnnounceResponse{}, fmt.Errorf("announce response too short")
-	}
-	action := binary.BigEndian.Uint32(buf[0:4])
-
-	if action == ActionError {
-		return AnnounceResponse{}, fmt.Errorf("tracker error %s", string(buf[8:n]))
-	}
-	// Parse response
-	resp := udpAnnounceResponse{
-		action:        action,
-		transactionID: binary.BigEndian.Uint32(buf[4:8]),
-		interval:      binary.BigEndian.Uint32(buf[8:12]),
-		leechers:      binary.BigEndian.Uint32(buf[12:16]),
-		seeders:       binary.BigEndian.Uint32(buf[16:20]),
-	}
-	peerBytes := buf[20:n]
-
-	if (n-20)%6 != 0 {
-		return AnnounceResponse{}, fmt.Errorf("invalid peer data length")
-	}
-	peerCount := len(peerBytes) / 6
-
-	resp.peers = make([]Peer, peerCount)
-	for i := range peerCount {
-		ip := make(net.IP, 4)
-		copy(ip, peerBytes[i*6:i*6+4])
-		resp.peers[i] = Peer{
-			IP:   ip,
-			Port: uint16(binary.BigEndian.Uint16(peerBytes[i*6+4 : i*6+6])),
-		}
-	}
-
-	if resp.action != ActionAnnounce {
-		return AnnounceResponse{}, fmt.Errorf("invalid action: %d", resp.action)
-	}
-
-	if resp.transactionID != announceTxID {
-		return AnnounceResponse{}, fmt.Errorf("invalid transaction ID: %d", resp.transactionID)
-	}
-
-	// return peers, interval
-	interval := time.Duration(resp.interval) * time.Second
+	interval := time.Duration(binary.BigEndian.Uint32(resp[8:12])) * time.Second
 	if interval <= 0 {
 		interval = DefaultAnnounceInterval
 	}
-	return AnnounceResponse{Peers: resp.peers, Interval: interval}, nil
+	return AnnounceResponse{Peers: peers, Interval: interval}, nil
 }
 
-// connectionExpired returns true if the connection has expired (more than a minute since creation) 55 seconds for avoiding edge cases
-func (t *UDPTracker) connectionExpired() bool {
-	return time.Since(t.connectionCreatedAt) > 55*time.Second
-}
-
-// Ensure the connection is not expired before sending an announce
-func (t *UDPTracker) EnsureConnection() error {
-	return t.EnsureConnectionContext(context.Background())
-}
-
-// EnsureConnectionContext refreshes an expired connection within ctx's deadline.
-func (t *UDPTracker) EnsureConnectionContext(ctx context.Context) error {
-	if t.conn == nil {
-		_, err := t.ConnectContext(ctx, t.addr)
-		return err
-	}
-	if t.connectionExpired() {
-		if t.conn != nil {
-			t.conn.Close()
-			t.conn = nil
-			t.connectionID = 0
-			t.connectionCreatedAt = time.Time{}
+// roundTrip sends req and returns the first reply carrying txID. It
+// retransmits with an exponentially growing timeout (BEP 15) and ignores
+// datagrams with another transaction ID, such as late replies to earlier
+// attempts.
+func (t *udpTracker) roundTrip(ctx context.Context, req []byte, txID uint32) ([]byte, error) {
+	buf := make([]byte, udpMaxDatagram)
+	timeout := t.baseTimeout
+	for range udpMaxAttempts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		_, err := t.ConnectContext(ctx, t.addr)
-		return err
+		if _, err := t.conn.Write(req); err != nil {
+			return nil, err
+		}
+		if err := t.conn.SetReadDeadline(operationDeadline(ctx, timeout)); err != nil {
+			return nil, err
+		}
+		for {
+			n, err := t.conn.Read(buf)
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				break // retransmit
+			}
+			if err != nil {
+				return nil, err
+			}
+			if n < 8 || binary.BigEndian.Uint32(buf[4:8]) != txID {
+				continue // stray or duplicate datagram
+			}
+			return buf[:n:n], nil
+		}
+		timeout *= 2
 	}
-	return nil
-}
-
-func (t *UDPTracker) Close() error {
-	if t.conn != nil {
-		err := t.conn.Close()
-		t.conn = nil
-		t.connectionID = 0
-		t.connectionCreatedAt = time.Time{}
-		return err
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(errUDPTimeout, err)
 	}
-	return nil
+	return nil, errUDPTimeout
 }
 
-// AnnounceUDP sends an announce request to a UDP tracker and returns the list of peers.
-func AnnounceUDP(announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultAnnounceTimeout)
-	defer cancel()
-	return AnnounceUDPContext(ctx, announceURL, infoHash, peerID, port, totalLength)
+// checkAction reports a tracker error reply, or a reply for the wrong action.
+// The error action is checked first so its message is never mistaken for a
+// short or malformed reply.
+func checkAction(resp []byte, want uint32) error {
+	switch action := binary.BigEndian.Uint32(resp[0:4]); action {
+	case want:
+		return nil
+	case ActionError:
+		return fmt.Errorf("tracker error: %s", sanitizeTrackerText(resp[8:]))
+	default:
+		return fmt.Errorf("%w: action %d, want %d", errUDPMalformed, action, want)
+	}
 }
 
-// AnnounceUDPContext sends a UDP announce that can be cancelled by ctx.
-func AnnounceUDPContext(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
-	response, err := announceUDP(ctx, announceURL, AnnounceRequest{
-		InfoHash: infoHash,
-		PeerID:   peerID,
-		Port:     port,
-		Left:     uint64(totalLength),
-		Event:    EventStarted,
-	})
-	return response.Peers, err
+// sanitizeTrackerText makes tracker-supplied text safe to print: it is
+// truncated and quoted so control characters cannot reach the terminal.
+func sanitizeTrackerText(b []byte) string {
+	if len(b) > maxTrackerMessage {
+		b = b[:maxTrackerMessage]
+	}
+	return strconv.Quote(string(b))
 }
 
-func announceUDP(ctx context.Context, announceURL string, request AnnounceRequest) (AnnounceResponse, error) {
-	addr, err := resolveUDPAddrContext(ctx, announceURL)
+func announceUDP(ctx context.Context, hostPort string, request AnnounceRequest) (AnnounceResponse, error) {
+	addr, err := resolveUDPAddrContext(ctx, hostPort)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("resolving UDP tracker address: %w", err)
 	}
-
-	t := &UDPTracker{}
-	if _, err := t.ConnectContext(ctx, addr); err != nil {
-		return AnnounceResponse{}, fmt.Errorf("connecting to UDP tracker: %w", err)
+	t, err := dialUDPTracker(addr)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("opening UDP tracker socket: %w", err)
 	}
 	defer t.Close()
 
-	response, err := t.announceRequestContext(ctx, request)
+	response, err := t.announce(ctx, request)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("UDP tracker announce: %w", err)
+		return AnnounceResponse{}, fmt.Errorf("udp tracker: %w", err)
 	}
 	return response, nil
 }

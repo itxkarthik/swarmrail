@@ -42,6 +42,9 @@ type AnnounceRequest struct {
 	Downloaded uint64
 	Left       uint64
 	Event      AnnounceEvent
+	// Key identifies this client across IP changes. Zero means the
+	// process-wide session key.
+	Key uint32
 }
 
 type AnnounceResponse struct {
