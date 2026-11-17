@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/itxkarthik/swarmrail/internal/bencode"
@@ -38,28 +40,11 @@ func AnnounceHTTPContext(ctx context.Context, announceURL string, infoHash [20]b
 }
 
 func announceHTTP(ctx context.Context, announceURL string, request AnnounceRequest) (AnnounceResponse, error) {
-	// Parse the announce URL
 	parsedURL, err := url.Parse(announceURL)
 	if err != nil {
 		return AnnounceResponse{}, err
 	}
-	// Set the query parameters
-	query := parsedURL.Query()
-	query.Set("info_hash", string(request.InfoHash[:]))
-	query.Set("peer_id", string(request.PeerID[:]))
-	query.Set("port", fmt.Sprintf("%d", request.Port))
-	query.Set("uploaded", fmt.Sprintf("%d", request.Uploaded))
-	query.Set("downloaded", fmt.Sprintf("%d", request.Downloaded))
-	query.Set("left", fmt.Sprintf("%d", request.Left))
-	query.Set("compact", "1")
-	if event := request.Event.HTTPValue(); event != "" {
-		query.Set("event", event)
-	} else {
-		query.Del("event")
-	}
-	// Encode the query parameters and set the URL
-	parsedURL.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, buildAnnounceURL(parsedURL, request), nil)
 	if err != nil {
 		return AnnounceResponse{}, err
 	}
@@ -79,6 +64,60 @@ func announceHTTP(ctx context.Context, announceURL string, request AnnounceReque
 	}
 	// Parse the response body
 	return parseHTTPResponse(body)
+}
+
+// buildAnnounceURL appends the BEP 3 announce parameters to base.
+//
+// info_hash and peer_id are raw bytes, so they are percent-encoded byte by
+// byte. url.Values would use form encoding and turn 0x20 into '+', which
+// some trackers decode as a literal plus, giving a different infohash. The
+// tracker's own query (often a private passkey) is kept exactly as given
+// rather than parsed and re-encoded, which could reorder or re-escape it.
+func buildAnnounceURL(base *url.URL, request AnnounceRequest) string {
+	key := request.Key
+	if key == 0 {
+		key = sessionKey
+	}
+	params := url.Values{}
+	params.Set("port", strconv.FormatUint(uint64(request.Port), 10))
+	params.Set("uploaded", strconv.FormatUint(request.Uploaded, 10))
+	params.Set("downloaded", strconv.FormatUint(request.Downloaded, 10))
+	params.Set("left", strconv.FormatUint(request.Left, 10))
+	params.Set("compact", "1")
+	params.Set("key", fmt.Sprintf("%08x", key))
+	if event := request.Event.HTTPValue(); event != "" {
+		params.Set("event", event)
+	}
+
+	query := "info_hash=" + escapeBinary(request.InfoHash[:]) +
+		"&peer_id=" + escapeBinary(request.PeerID[:]) +
+		"&" + params.Encode()
+	u := *base
+	if u.RawQuery != "" {
+		query = u.RawQuery + "&" + query
+	}
+	u.RawQuery = query
+	u.Fragment = ""
+	return u.String()
+}
+
+// escapeBinary percent-encodes every byte outside the RFC 3986 unreserved
+// set (ALPHA / DIGIT / "-" / "." / "_" / "~").
+func escapeBinary(b []byte) string {
+	const hex = "0123456789ABCDEF"
+	var sb strings.Builder
+	sb.Grow(len(b) * 3)
+	for _, c := range b {
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' ||
+			c == '-' || c == '.' || c == '_' || c == '~' {
+			sb.WriteByte(c)
+			continue
+		}
+		sb.WriteByte('%')
+		sb.WriteByte(hex[c>>4])
+		sb.WriteByte(hex[c&0x0F])
+	}
+	return sb.String()
 }
 
 // parseHTTPResponse parses the HTTP response body and returns a list of peers.
