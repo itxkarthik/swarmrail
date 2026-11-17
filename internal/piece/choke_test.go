@@ -255,19 +255,59 @@ func TestWorkerSendsInterestedOnlyWhenPeerHasNeededPiece(t *testing.T) {
 	m.SetCompleted([]bool{true, false})
 	startDownload(t, m)
 
-	select {
-	case id := <-remote.control:
-		t.Fatalf("sent message %d to a peer with nothing we need", id)
-	case <-time.After(300 * time.Millisecond):
+	// Our catch-up Have for piece 0 is fine; Interested is not.
+	quiet := time.After(300 * time.Millisecond)
+	for waiting := true; waiting; {
+		select {
+		case id := <-remote.control:
+			if id == peer.MsgInterested {
+				t.Fatal("sent Interested to a peer with nothing we need")
+			}
+		case <-quiet:
+			waiting = false
+		}
 	}
 
 	remote.send(peer.BuildHave(1))
-	select {
-	case id := <-remote.control:
-		if id != peer.MsgInterested {
-			t.Fatalf("message ID = %d, want interested", id)
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case id := <-remote.control:
+			if id == peer.MsgInterested {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no Interested after the peer announced a needed piece")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no Interested after the peer announced a needed piece")
 	}
+}
+
+// A choke immediately followed by an unchoke still discards every request
+// sent before it. The worker must notice even though the peer is unchoked by
+// the time it wakes, instead of waiting out the snub timeout.
+func TestWorkerRerequestsAfterQuickChokeUnchoke(t *testing.T) {
+	tf, payload := twoBlockTorrent()
+	pc, remote := newScriptedPeer(t, tf)
+	remote.send(&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}})
+	remote.send(&peer.Message{ID: peer.MsgUnchoke})
+
+	m := NewManager(tf, []*peer.PeerConnection{pc})
+	dir, done := startDownload(t, m)
+
+	for range 2 {
+		if _, ok := remote.nextRequest(2 * time.Second); !ok {
+			t.Fatal("initial requests not sent")
+		}
+	}
+	remote.send(&peer.Message{ID: peer.MsgChoke})
+	remote.send(&peer.Message{ID: peer.MsgUnchoke})
+
+	for served := 0; served < 2; served++ {
+		work, ok := remote.nextRequest(2 * time.Second)
+		if !ok {
+			t.Fatal("requests were not re-sent after a quick choke/unchoke")
+		}
+		remote.serve(work, payload)
+	}
+	waitDownload(t, done, dir, tf, payload)
 }

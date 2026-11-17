@@ -34,6 +34,7 @@ type PeerConnection struct {
 	conn          net.Conn
 	peerID        [20]byte
 	peerChoking   atomic.Bool    // BEP 3 peer_choking: the remote is choking us
+	chokes        atomic.Uint64  // number of Choke messages received
 	amInterested  atomic.Bool    // BEP 3 am_interested: we told the remote we want data
 	bitfield      []bool         // pieces the remote has
 	incoming      chan *Message  // reader -> download worker (requested blocks only)
@@ -148,6 +149,7 @@ func (pc *PeerConnection) reader() {
 		case MsgChoke:
 			// BEP 3: a choking peer discards our outstanding requests.
 			pc.peerChoking.Store(true)
+			pc.chokes.Add(1)
 			pc.clearPending()
 			pc.signalStateChange()
 		case MsgUnchoke:
@@ -218,6 +220,12 @@ func (pc *PeerConnection) sendUnchoke() {
 
 // PeerChoking reports whether the remote is currently choking us.
 func (pc *PeerConnection) PeerChoking() bool { return pc.peerChoking.Load() }
+
+// ChokeCount returns how many times the remote has choked us. A worker
+// compares it before and after waiting: a choke followed quickly by an
+// unchoke leaves PeerChoking false, but every request sent before the choke
+// was still discarded.
+func (pc *PeerConnection) ChokeCount() uint64 { return pc.chokes.Load() }
 
 // Request sends a block request to the remote. It returns false without
 // sending anything when the remote is choking us, MaxPendingRequests are

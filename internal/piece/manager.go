@@ -385,6 +385,10 @@ func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx
 		}
 	}
 
+	// Any choke after this point discards requests sent for this piece, even
+	// if an unchoke follows before this worker wakes up.
+	chokes := p.ChokeCount()
+
 	numBlocks := (len(pieceData) + blockSize - 1) / blockSize
 	requested := make([]bool, numBlocks)
 	received := make([]bool, numBlocks)
@@ -400,6 +404,9 @@ func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx
 			}
 			begin := next * blockSize
 			length := min(blockSize, len(pieceData)-begin)
+			if p.ChokeCount() != chokes {
+				return errChoked
+			}
 			if !p.Request(peer.PieceWork{Index: idx, Begin: begin, Length: length}) {
 				if p.PeerChoking() {
 					return errChoked
@@ -437,7 +444,7 @@ func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx
 				return errPieceDone
 			}
 		case <-p.StateChanged():
-			if p.PeerChoking() {
+			if p.PeerChoking() || p.ChokeCount() != chokes {
 				return errChoked
 			}
 			if m.isCompleted(uint32(idx)) {
