@@ -18,7 +18,7 @@ func TestNewPeerConnection(t *testing.T) {
 	if pc == nil {
 		t.Fatal("NewPeerConnection returned nil")
 	}
-	if pc.choked.Load() != true {
+	if pc.PeerChoking() != true {
 		t.Fatal("expected PeerConnection to start choked")
 	}
 	if pc.peerID != peerID {
@@ -111,7 +111,7 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 	pc.Start()
 	defer pc.Close()
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to start choked")
 	}
 
@@ -123,7 +123,7 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 	// Give the reader time to process and update state
 	time.Sleep(100 * time.Millisecond)
 
-	if pc.choked.Load() {
+	if pc.PeerChoking() {
 		t.Fatal("expected to be unchoked after receiving unchoke message")
 	}
 
@@ -134,7 +134,7 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to be choked after receiving choke message")
 	}
 }
@@ -151,7 +151,7 @@ func TestPeerConnection_ReaderHandlesUnchoke(t *testing.T) {
 	pc.Start()
 	defer pc.Close()
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to start choked")
 	}
 
@@ -162,7 +162,7 @@ func TestPeerConnection_ReaderHandlesUnchoke(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if pc.choked.Load() {
+	if pc.PeerChoking() {
 		t.Fatal("expected to be unchoked")
 	}
 
@@ -207,7 +207,7 @@ func TestPeerConnection_ReaderKeepalive(t *testing.T) {
 	}
 }
 
-func TestPeerConnection_AssignWorkWhenChoked(t *testing.T) {
+func TestPeerConnection_RequestWhenChoked(t *testing.T) {
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -219,14 +219,13 @@ func TestPeerConnection_AssignWorkWhenChoked(t *testing.T) {
 	pc.Start()
 	defer pc.Close()
 
-	// Should not accept work when choked
-	ok := pc.AssignWork(PieceWork{Index: 5, Begin: 0, Length: 16384})
-	if ok {
-		t.Fatal("AssignWork should return false when choked")
+	// Should not send requests while choked
+	if pc.Request(PieceWork{Index: 5, Begin: 0, Length: 16384}) {
+		t.Fatal("Request should return false when choked")
 	}
 }
 
-func TestPeerConnection_AssignWorkWhenUnchoked(t *testing.T) {
+func TestPeerConnection_RequestWhenUnchoked(t *testing.T) {
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -244,10 +243,10 @@ func TestPeerConnection_AssignWorkWhenUnchoked(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Should accept work now
-	ok := pc.AssignWork(PieceWork{Index: 5, Begin: 0, Length: 16384})
-	if !ok {
-		t.Fatal("AssignWork should return true when unchoked")
+	// Should send requests now
+	go func() { _, _ = ReadMessage(conn2) }()
+	if !pc.Request(PieceWork{Index: 5, Begin: 0, Length: 16384}) {
+		t.Fatal("Request should return true when unchoked")
 	}
 }
 

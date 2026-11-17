@@ -11,18 +11,22 @@ import (
 
 const defaultTimeout = 30 * time.Second
 
+// MaxPendingRequests caps the block requests a download worker keeps
+// outstanding on one connection. It also sizes the incoming channel, so the
+// reader can always hand over a requested block without blocking.
+const MaxPendingRequests = 32
+
 // PeerConnection manages a single peer's TCP connection with a reader/writer
 // goroutine pair. Supports both downloading (requesting blocks) and uploading
 // (responding to peer requests).
 type PeerConnection struct {
 	conn          net.Conn
 	peerID        [20]byte
-	choked        atomic.Bool
-	bitfield      []bool
-	incoming      chan *Message  // reader -> download worker (piece messages only)
-	pieceQueue    chan PieceWork // manager -> writer (download requests to send)
+	peerChoking   atomic.Bool    // BEP 3 peer_choking: the remote is choking us
+	bitfield      []bool         // pieces the remote has
+	incoming      chan *Message  // reader -> download worker (requested blocks only)
 	pieceRequests chan PieceWork // reader -> writer (upload requests from remote peer)
-	outgoing      chan *Message  // manager/reader -> writer (control messages: unchoke, have, bitfield)
+	outgoing      chan *Message  // everyone -> writer (requests, control messages)
 	ctx           context.Context
 	cancel        context.CancelFunc
 	closeOnce     sync.Once
@@ -35,9 +39,10 @@ type PeerConnection struct {
 	bitfieldMu    sync.RWMutex
 	stateChanged  chan struct{} // cap 1; signalled on choke, unchoke, have and bitfield
 
-	// Choked wait: writer parks here when choked, reader signals on unchoke
-	unchokeMu   sync.Mutex
-	unchokeCond *sync.Cond
+	// pending holds block requests sent to the remote and not yet answered.
+	// The reader forwards a Piece message only when it matches one of them.
+	pendingMu sync.Mutex
+	pending   map[PieceWork]struct{}
 
 	// Upload callback: set by Manager to serve piece data from disk
 	getPieceData func(PieceWork) ([]byte, bool)
@@ -70,17 +75,16 @@ func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *Pee
 	pc := &PeerConnection{
 		conn:          conn,
 		peerID:        peerID,
-		incoming:      make(chan *Message, 100),
-		pieceQueue:    make(chan PieceWork, 10),
+		incoming:      make(chan *Message, MaxPendingRequests),
 		pieceRequests: make(chan PieceWork, 10),
-		outgoing:      make(chan *Message, 10),
+		outgoing:      make(chan *Message, 2*MaxPendingRequests),
 		ctx:           ctx,
 		cancel:        cancel,
 		direction:     direction,
 		stateChanged:  make(chan struct{}, 1),
+		pending:       make(map[PieceWork]struct{}),
 	}
-	pc.choked.Store(true)
-	pc.unchokeCond = sync.NewCond(&pc.unchokeMu)
+	pc.peerChoking.Store(true) // BEP 3: connections start choked
 	return pc
 }
 
@@ -92,12 +96,10 @@ func (pc *PeerConnection) Start() {
 func (pc *PeerConnection) reader() {
 	defer pc.Close()
 	for {
-		// Set deadline
 		if err := pc.conn.SetReadDeadline(time.Now().Add(defaultTimeout)); err != nil {
 			return
 		}
 
-		// Read data
 		msg, err := ReadMessage(pc.conn)
 		if err != nil {
 			return // connection lost
@@ -116,55 +118,65 @@ func (pc *PeerConnection) reader() {
 		// and block this goroutine, which would also stop uploads.
 		switch msg.ID {
 		case MsgChoke:
-			pc.choked.Store(true)
+			// BEP 3: a choking peer discards our outstanding requests.
+			pc.peerChoking.Store(true)
+			pc.clearPending()
 			pc.signalStateChange()
-			continue
 		case MsgUnchoke:
-			pc.choked.Store(false)
-			// Wake the writer so it can resume sending requests.
-			pc.unchokeCond.Broadcast()
+			pc.peerChoking.Store(false)
 			pc.signalStateChange()
-			continue
 		case MsgRequest:
-			// Remote peer wants a piece from us — route to upload handler.
-			if len(msg.Payload) >= 12 {
-				index := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
-				begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
-				length := int(binary.BigEndian.Uint32(msg.Payload[8:12]))
-				work := PieceWork{Index: index, Begin: begin, Length: length}
-				if !ValidateRequest(work, totalPieces, pieceLength, totalLength) {
-					continue
-				}
-				select {
-				case pc.pieceRequests <- work:
-				case <-pc.ctx.Done():
-					return
-				}
+			work := PieceWork{
+				Index:  int(binary.BigEndian.Uint32(msg.Payload[0:4])),
+				Begin:  int(binary.BigEndian.Uint32(msg.Payload[4:8])),
+				Length: int(binary.BigEndian.Uint32(msg.Payload[8:12])),
 			}
-			continue // don't send to incoming
+			if !ValidateRequest(work, totalPieces, pieceLength, totalLength) {
+				continue
+			}
+			select {
+			case pc.pieceRequests <- work:
+			case <-pc.ctx.Done():
+				return
+			}
 		case MsgInterested:
 			// Peer wants our pieces — auto-unchoke them immediately.
 			pc.sendUnchoke()
-			continue
-		case MsgNotInterested:
-			continue
 		case MsgBitfield:
 			pc.SetBitfield(ParseBitfield(msg.Payload, totalPieces))
 			pc.signalStateChange()
-			continue
 		case MsgHave:
 			pc.MarkPieceAvailable(binary.BigEndian.Uint32(msg.Payload))
-			continue
 		case MsgPiece:
-		default:
-			continue // cancel and unsupported extension messages
+			pc.deliverBlock(msg)
 		}
+		// Cancel, NotInterested and unsupported extension messages need no
+		// action yet.
+	}
+}
 
-		select {
-		case pc.incoming <- msg:
-		case <-pc.ctx.Done():
-			return
-		}
+// deliverBlock hands a Piece message to the download worker if it answers a
+// request we sent. Unrequested blocks (late replies after a choke or cancel,
+// or junk) are dropped. Because only pending requests are forwarded and
+// pending is capped at MaxPendingRequests, the send never has to block.
+func (pc *PeerConnection) deliverBlock(msg *Message) {
+	work := PieceWork{
+		Index:  int(binary.BigEndian.Uint32(msg.Payload[0:4])),
+		Begin:  int(binary.BigEndian.Uint32(msg.Payload[4:8])),
+		Length: len(msg.Payload) - 8,
+	}
+	pc.pendingMu.Lock()
+	_, requested := pc.pending[work]
+	delete(pc.pending, work)
+	pc.pendingMu.Unlock()
+	if !requested {
+		return
+	}
+	select {
+	case pc.incoming <- msg:
+	default:
+		// Unreachable while the pending cap holds; dropping is safe because
+		// the worker re-requests blocks that never arrive.
 	}
 }
 
@@ -176,18 +188,56 @@ func (pc *PeerConnection) sendUnchoke() {
 	}
 }
 
-// AssignWork queues a download request for the writer to send to the peer.
-// Returns false if the peer is choked or the connection is closing.
-func (pc *PeerConnection) AssignWork(work PieceWork) bool {
-	if pc.choked.Load() {
+// PeerChoking reports whether the remote is currently choking us.
+func (pc *PeerConnection) PeerChoking() bool { return pc.peerChoking.Load() }
+
+// Request sends a block request to the remote. It returns false without
+// sending anything when the remote is choking us, MaxPendingRequests are
+// already outstanding, or the connection is closed. Requests are tracked so
+// the matching Piece reply can be delivered on Incoming.
+func (pc *PeerConnection) Request(work PieceWork) bool {
+	if pc.peerChoking.Load() {
 		return false
 	}
+	pc.pendingMu.Lock()
+	if len(pc.pending) >= MaxPendingRequests {
+		pc.pendingMu.Unlock()
+		return false
+	}
+	pc.pending[work] = struct{}{}
+	pc.pendingMu.Unlock()
+
 	select {
-	case pc.pieceQueue <- work:
+	case pc.outgoing <- BuildRequest(work.Index, work.Begin, work.Length):
 		return true
 	case <-pc.ctx.Done():
 		return false
 	}
+}
+
+// CancelPending sends Cancel for every outstanding request and forgets them,
+// so late replies are dropped. Workers call it when they abandon a piece.
+func (pc *PeerConnection) CancelPending() {
+	for _, work := range pc.clearPending() {
+		msg := BuildRequest(work.Index, work.Begin, work.Length)
+		msg.ID = MsgCancel
+		select {
+		case pc.outgoing <- msg:
+		case <-pc.ctx.Done():
+			return
+		}
+	}
+}
+
+func (pc *PeerConnection) clearPending() []PieceWork {
+	pc.pendingMu.Lock()
+	defer pc.pendingMu.Unlock()
+	out := make([]PieceWork, 0, len(pc.pending))
+	for work := range pc.pending {
+		out = append(out, work)
+	}
+	clear(pc.pending)
+	return out
 }
 
 // SetPieceDataHandler registers a callback that the writer uses to look up
@@ -235,32 +285,16 @@ func (pc *PeerConnection) SendInterested() bool {
 	}
 }
 
+// writer is the only goroutine that writes to the socket, so frames are never
+// interleaved. It never blocks on peer state: a choke only affects which
+// requests the worker queues, never whether Have, Unchoke or piece data can
+// be sent.
 func (pc *PeerConnection) writer() {
 	defer pc.Close()
 	for {
 		select {
-		case work, ok := <-pc.pieceQueue:
-			if !ok {
-				return
-			}
-
-			pc.waitForUnchoke()
-
-			// If the context was cancelled while we were waiting, bail out.
-			if pc.ctx.Err() != nil {
-				return
-			}
-
-			msg := BuildRequest(work.Index, work.Begin, work.Length)
-			if err := pc.writeMessage(msg); err != nil {
-				return
-			}
-
-		case req, ok := <-pc.pieceRequests:
-			if !ok {
-				return
-			}
-			// Upload: remote peer requested a piece from us.
+		case req := <-pc.pieceRequests:
+			// Upload: remote peer requested a block from us.
 			data, ok := pc.pieceData(req)
 			if !ok || len(data) == 0 {
 				continue
@@ -270,10 +304,7 @@ func (pc *PeerConnection) writer() {
 				return
 			}
 
-		case msg, ok := <-pc.outgoing:
-			if !ok {
-				return
-			}
+		case msg := <-pc.outgoing:
 			if err := pc.writeMessage(msg); err != nil {
 				return
 			}
@@ -298,19 +329,6 @@ func (pc *PeerConnection) writeMessage(msg *Message) error {
 	return nil
 }
 
-// waitForUnchoke blocks until the peer unchokes us or the context is cancelled.
-func (pc *PeerConnection) waitForUnchoke() {
-	pc.unchokeMu.Lock()
-	defer pc.unchokeMu.Unlock()
-	for pc.choked.Load() {
-		// Check if context was cancelled while we held the lock.
-		if pc.ctx.Err() != nil {
-			return
-		}
-		pc.unchokeCond.Wait()
-	}
-}
-
 func BuildRequest(index, begin, length int) *Message {
 	payload := make([]byte, 12)
 	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
@@ -322,8 +340,6 @@ func BuildRequest(index, begin, length int) *Message {
 func (pc *PeerConnection) Close() {
 	pc.closeOnce.Do(func() {
 		pc.cancel()
-		pc.choked.Store(false)
-		pc.unchokeCond.Broadcast()
 		pc.conn.Close()
 	})
 }
@@ -385,7 +401,8 @@ func (pc *PeerConnection) PeerID() [20]byte      { return pc.peerID }
 func (pc *PeerConnection) UploadedBytes() uint64 { return pc.uploaded.Load() }
 func (pc *PeerConnection) Active() bool          { return pc.ctx.Err() == nil }
 
-// Incoming returns the piece messages received from this peer.
+// Incoming returns the Piece messages that answer this connection's pending
+// requests. Each delivered block was requested and has the requested length.
 func (pc *PeerConnection) Incoming() <-chan *Message {
 	return pc.incoming
 }
