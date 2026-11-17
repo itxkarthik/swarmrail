@@ -136,8 +136,8 @@ func (l *PeerListener) handle(ctx context.Context, conn net.Conn) {
 	connection := peer.NewInboundPeerConnection(conn, remoteID)
 	connection.ConfigureTorrent(len(l.torrent.PieceHashes), l.torrent.PieceLength, l.torrent.Length)
 	connection.SetBitfield(make([]bool, len(l.torrent.PieceHashes)))
-	connection.Start()
-	if !connection.SendInterested() || l.manager.AddPeers([]*peer.PeerConnection{connection}) != 1 {
+	connection.Start(l.manager.BitfieldMessage())
+	if l.manager.AddPeers([]*peer.PeerConnection{connection}) != 1 {
 		connection.Close()
 		l.recordRejected(errors.New("duplicate or closed inbound peer"))
 		return

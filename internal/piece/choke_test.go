@@ -23,6 +23,7 @@ type scriptedPeer struct {
 	conn     net.Conn
 	requests chan peer.PieceWork
 	cancels  chan peer.PieceWork
+	control  chan peer.MessageID // every other message the client sends
 }
 
 func newScriptedPeer(t *testing.T, tf *torrent.TorrentFile) (*peer.PeerConnection, *scriptedPeer) {
@@ -31,12 +32,13 @@ func newScriptedPeer(t *testing.T, tf *torrent.TorrentFile) (*peer.PeerConnectio
 	pc := peer.NewPeerConnection(client, [20]byte{9})
 	pc.ConfigureTorrent(len(tf.PieceHashes), tf.PieceLength, tf.Length)
 	pc.SetBitfield(make([]bool, len(tf.PieceHashes)))
-	pc.Start()
+	pc.Start(nil)
 	sp := &scriptedPeer{
 		t:        t,
 		conn:     server,
 		requests: make(chan peer.PieceWork, 64),
 		cancels:  make(chan peer.PieceWork, 64),
+		control:  make(chan peer.MessageID, 64),
 	}
 	go func() {
 		for {
@@ -44,7 +46,11 @@ func newScriptedPeer(t *testing.T, tf *torrent.TorrentFile) (*peer.PeerConnectio
 			if err != nil {
 				return
 			}
-			if msg == nil || (msg.ID != peer.MsgRequest && msg.ID != peer.MsgCancel) {
+			if msg == nil {
+				continue
+			}
+			if msg.ID != peer.MsgRequest && msg.ID != peer.MsgCancel {
+				sp.control <- msg.ID
 				continue
 			}
 			work := peer.PieceWork{
@@ -233,5 +239,35 @@ func TestUnrequestedBlocksAreDropped(t *testing.T) {
 	case msg := <-pc.Incoming():
 		t.Fatalf("unrequested block delivered: index %d", binary.BigEndian.Uint32(msg.Payload))
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// BEP 3: interested means the remote has a piece we lack.
+func TestWorkerSendsInterestedOnlyWhenPeerHasNeededPiece(t *testing.T) {
+	tf := &torrent.TorrentFile{
+		Name: "interest.bin", Length: 8, PieceLength: 4,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("aaaa")), sha1.Sum([]byte("bbbb"))},
+	}
+	pc, remote := newScriptedPeer(t, tf)
+	remote.send(&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}}) // has piece 0 only
+
+	m := NewManager(tf, []*peer.PeerConnection{pc})
+	m.SetCompleted([]bool{true, false})
+	startDownload(t, m)
+
+	select {
+	case id := <-remote.control:
+		t.Fatalf("sent message %d to a peer with nothing we need", id)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	remote.send(peer.BuildHave(1))
+	select {
+	case id := <-remote.control:
+		if id != peer.MsgInterested {
+			t.Fatalf("message ID = %d, want interested", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no Interested after the peer announced a needed piece")
 	}
 }

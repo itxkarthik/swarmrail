@@ -23,6 +23,7 @@ type PeerConnection struct {
 	conn          net.Conn
 	peerID        [20]byte
 	peerChoking   atomic.Bool    // BEP 3 peer_choking: the remote is choking us
+	amInterested  atomic.Bool    // BEP 3 am_interested: we told the remote we want data
 	bitfield      []bool         // pieces the remote has
 	incoming      chan *Message  // reader -> download worker (requested blocks only)
 	pieceRequests chan PieceWork // reader -> writer (upload requests from remote peer)
@@ -88,13 +89,18 @@ func newPeerConnection(conn net.Conn, peerID [20]byte, direction Direction) *Pee
 	return pc
 }
 
-func (pc *PeerConnection) Start() {
+// Start launches the reader and writer goroutines. If first is not nil it is
+// written before any other message; callers pass the local bitfield so that,
+// as BEP 3 requires, it is the first message after the handshake. Pass nil
+// when we have no pieces: an all-zero bitfield is optional.
+func (pc *PeerConnection) Start(first *Message) {
 	go pc.reader()
-	go pc.writer()
+	go pc.writer(first)
 }
 
 func (pc *PeerConnection) reader() {
 	defer pc.Close()
+	seenMessage := false
 	for {
 		if err := pc.conn.SetReadDeadline(time.Now().Add(defaultTimeout)); err != nil {
 			return
@@ -111,6 +117,11 @@ func (pc *PeerConnection) reader() {
 		if err := ValidateMessage(msg, totalPieces); err != nil {
 			return
 		}
+		// BEP 3: bitfield is only ever sent as the first message.
+		if msg.ID == MsgBitfield && seenMessage {
+			return
+		}
+		seenMessage = true
 
 		// Fold protocol state into the connection here and forward only the
 		// messages a download worker consumes. Anything else on the incoming
@@ -266,31 +277,36 @@ func (pc *PeerConnection) SendHave(index uint32) {
 	}
 }
 
-// SendBitfield queues a Bitfield message to announce our available pieces.
-func (pc *PeerConnection) SendBitfield(bits []byte) {
+// SetInterested tells the remote whether it has pieces we want. Interested
+// or NotInterested is sent only when the state changes.
+func (pc *PeerConnection) SetInterested(interested bool) {
+	if !pc.amInterested.CompareAndSwap(!interested, interested) {
+		return
+	}
+	id := MsgNotInterested
+	if interested {
+		id = MsgInterested
+	}
 	select {
-	case pc.outgoing <- &Message{ID: MsgBitfield, Payload: bits}:
+	case pc.outgoing <- &Message{ID: id}:
 	case <-pc.ctx.Done():
 	}
 }
 
-// SendInterested queues an Interested message through the connection's single
-// writer goroutine. It returns false when the connection is already closed.
-func (pc *PeerConnection) SendInterested() bool {
-	select {
-	case pc.outgoing <- &Message{ID: MsgInterested}:
-		return true
-	case <-pc.ctx.Done():
-		return false
-	}
-}
+// AmInterested reports whether we last told the remote we are interested.
+func (pc *PeerConnection) AmInterested() bool { return pc.amInterested.Load() }
 
 // writer is the only goroutine that writes to the socket, so frames are never
 // interleaved. It never blocks on peer state: a choke only affects which
 // requests the worker queues, never whether Have, Unchoke or piece data can
 // be sent.
-func (pc *PeerConnection) writer() {
+func (pc *PeerConnection) writer(first *Message) {
 	defer pc.Close()
+	if first != nil {
+		if err := pc.writeMessage(first); err != nil {
+			return
+		}
+	}
 	for {
 		select {
 		case req := <-pc.pieceRequests:

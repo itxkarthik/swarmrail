@@ -230,12 +230,31 @@ func (m *Manager) Download(parent context.Context, outputPath string, resume boo
 func (m *Manager) initPeerUpload(p *peer.PeerConnection) {
 	p.ConfigureTorrent(m.totalPieces, int64(m.pieceLength), int64(m.totalLength))
 	p.SetPieceDataHandler(m.readUploadBlock)
+}
 
-	bitfieldBytes := peer.BuildBitfieldBytes(m.Completed())
-	// Send our bitfield so the peer knows what we have.
-	if len(bitfieldBytes) > 0 {
-		p.SendBitfield(bitfieldBytes)
+// BitfieldMessage returns our bitfield as the first message to send on a new
+// connection, or nil when we have no verified pieces (the bitfield is then
+// optional under BEP 3).
+func (m *Manager) BitfieldMessage() *peer.Message {
+	completed := m.Completed()
+	if CountCompleted(completed) == 0 {
+		return nil
 	}
+	return &peer.Message{ID: peer.MsgBitfield, Payload: peer.BuildBitfieldBytes(completed)}
+}
+
+// needsFrom reports whether p has at least one piece we have not verified,
+// which is when BEP 3 says we should be interested in it.
+func (m *Manager) needsFrom(p *peer.PeerConnection) bool {
+	bf := p.Bitfield()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, has := range bf {
+		if has && i < len(m.completed) && !m.completed[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) readUploadBlock(work peer.PieceWork) ([]byte, bool) {
@@ -285,7 +304,9 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 		if ctx.Err() != nil {
 			return
 		}
-		if p.PeerChoking() {
+		want := m.needsFrom(p)
+		p.SetInterested(want)
+		if !want || p.PeerChoking() {
 			if !waitForStateChange(ctx, p) {
 				return
 			}

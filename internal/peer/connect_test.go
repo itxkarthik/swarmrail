@@ -1,6 +1,8 @@
 package peer
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -343,5 +345,87 @@ func TestConnectToPeers_EmptyPeers(t *testing.T) {
 	results := ConnectToPeers(torrentFile, []tracker.Peer{})
 	if len(results) != 0 {
 		t.Fatalf("expected 0 connections for empty peers, got %d", len(results))
+	}
+}
+
+func TestConnectToPeersSendsBitfieldFirstAndNoInterested(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var infoHash [20]byte
+	copy(infoHash[:], "testinfohash12345678")
+
+	received := make(chan []MessageID, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := AcceptHandshake(conn, infoHash, [20]byte{7}); err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		var ids []MessageID
+		for {
+			msg, err := ReadMessage(conn)
+			if err != nil {
+				break
+			}
+			if msg != nil {
+				ids = append(ids, msg.ID)
+			}
+		}
+		received <- ids
+	}()
+
+	tf := &torrent.TorrentFile{InfoHash: infoHash, PieceHashes: make([][20]byte, 8), PieceLength: 4, Length: 32}
+	addr := listener.Addr().(*net.TCPAddr)
+	bitfield := func() *Message { return &Message{ID: MsgBitfield, Payload: []byte{0x80}} }
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	connections, _ := ConnectToPeersWithContext(ctx, tf, []tracker.Peer{{IP: addr.IP, Port: uint16(addr.Port)}}, [20]byte{8}, bitfield)
+	for _, c := range connections {
+		defer c.Close()
+	}
+
+	select {
+	case ids := <-received:
+		if len(ids) != 1 || ids[0] != MsgBitfield {
+			t.Fatalf("remote received %v, want only [bitfield]", ids)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote did not finish reading")
+	}
+}
+
+func TestConnectToPeersRejectsSelfConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var infoHash [20]byte
+	localID := [20]byte{5}
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = AcceptHandshake(conn, infoHash, localID) // echoes our own ID back
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	tf := &torrent.TorrentFile{InfoHash: infoHash, PieceHashes: make([][20]byte, 1), PieceLength: 1, Length: 1}
+	addr := listener.Addr().(*net.TCPAddr)
+	connections, report := ConnectToPeersWithContext(context.Background(), tf, []tracker.Peer{{IP: addr.IP, Port: uint16(addr.Port)}}, localID, nil)
+	if len(connections) != 0 {
+		t.Fatal("connection to ourselves was accepted")
+	}
+	if len(report.Failures) != 1 || !errors.Is(report.Failures[0].Err, errSelfConnection) {
+		t.Fatalf("failures = %+v, want one self-connection failure", report.Failures)
 	}
 }

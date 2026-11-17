@@ -220,7 +220,7 @@ func run() error {
 				return discovery.Peers, announceErr
 			},
 			func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
-				return peer.ConnectToPeersWithID(&tf, discovered, peerID)
+				return peer.ConnectToPeersWithContext(ctx, &tf, discovered, peerID, m.BitfieldMessage)
 			},
 			func(status string) { fmt.Println(status) },
 		)
@@ -325,7 +325,7 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 					return discovery.Peers, err
 				},
 				func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
-					return peer.ConnectToPeersWithID(tf, discovered, peerID)
+					return peer.ConnectToPeersWithContext(ctx, tf, discovered, peerID, m.BitfieldMessage)
 				},
 				m.SetStatus,
 			)

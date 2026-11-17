@@ -3,6 +3,7 @@ package peer
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -13,6 +14,8 @@ import (
 )
 
 const peerIDPrefix = "-SR0001-"
+
+var errSelfConnection = errors.New("connected to ourselves")
 
 // ConnectFailure records where an outbound peer connection failed.
 type ConnectFailure struct {
@@ -55,25 +58,31 @@ func countSetBits(bits []bool) int {
 	return n
 }
 
-// ConnectToPeers opens TCP connections to each peer, performs the BitTorrent
-// handshake, reads the initial bitfield, and sends Interested.
+// ConnectToPeers opens TCP connections to each peer and performs the
+// BitTorrent handshake. It sends no bitfield and is kept for callers that
+// have no pieces yet.
 //
 // Returns only the peers that successfully completed the full handshake flow.
 // Unreachable or slow peers are skipped silently.
-func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerConnection {
-	connections, _ := ConnectToPeersWithID(torrent, peers, GeneratePeerID())
+func ConnectToPeers(tf *torrent.TorrentFile, peers []tracker.Peer) []*PeerConnection {
+	connections, _ := ConnectToPeersWithID(tf, peers, GeneratePeerID())
 	return connections
 }
 
 // ConnectToPeersWithID connects to peers using the same peer ID that was sent
 // to the tracker and returns diagnostics for failed connection stages.
-func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
-	return ConnectToPeersWithContext(context.Background(), torrent, peers, localPeerID)
+func ConnectToPeersWithID(tf *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
+	return ConnectToPeersWithContext(context.Background(), tf, peers, localPeerID, nil)
 }
 
 // ConnectToPeersWithContext cancels outstanding dials and handshakes when ctx
 // ends, which is required for periodic discovery shutdown.
-func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
+//
+// localBitfield, if not nil, is called once per connection right after the
+// handshake; a non-nil result is written as the first message (BEP 3).
+// Interested is not sent here: the download worker sends it once the remote
+// shows a piece we lack.
+func ConnectToPeersWithContext(ctx context.Context, tf *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte, localBitfield func() *Message) ([]*PeerConnection, ConnectReport) {
 	var (
 		mu          sync.Mutex
 		connections []*PeerConnection
@@ -102,7 +111,7 @@ func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile
 
 			// BitTorrent handshake
 			stopCancel := context.AfterFunc(ctx, func() { conn.Close() })
-			remoteID, err := Handshake(conn, torrent.InfoHash, localPeerID)
+			remoteID, err := Handshake(conn, tf.InfoHash, localPeerID)
 			cancelStopped := stopCancel()
 			if err != nil {
 				conn.Close()
@@ -118,19 +127,25 @@ func ConnectToPeersWithContext(ctx context.Context, torrent *torrent.TorrentFile
 			report.Handshaken++
 			mu.Unlock()
 
-			// Start goroutine pair (reader + writer)
-			pc := NewPeerConnection(conn, remoteID)
-			pc.ConfigureTorrent(len(torrent.PieceHashes), torrent.PieceLength, torrent.Length)
-			pc.Start()
-			if !pc.SendInterested() {
-				pc.Close()
-				recordFailure(addr, "interested", fmt.Errorf("connection closed"))
+			if remoteID == localPeerID {
+				conn.Close()
+				recordFailure(addr, "handshake", errSelfConnection)
 				return
 			}
 
+			// Configure before starting so the remote's bitfield cannot race
+			// with initialisation.
+			pc := NewPeerConnection(conn, remoteID)
+			pc.ConfigureTorrent(len(tf.PieceHashes), tf.PieceLength, tf.Length)
+			pc.SetBitfield(make([]bool, len(tf.PieceHashes)))
+			var first *Message
+			if localBitfield != nil {
+				first = localBitfield()
+			}
+			pc.Start(first)
+
 			// Wait briefly for the peer's initial bitfield or Have. BEP 3 peers
 			// with no pieces may send neither, so a timeout is not an error.
-			pc.SetBitfield(make([]bool, len(torrent.PieceHashes)))
 			select {
 			case <-pc.StateChanged():
 			case <-time.After(10 * time.Second):
