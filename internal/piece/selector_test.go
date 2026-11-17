@@ -30,10 +30,10 @@ func TestRarestPiece_SelectsLeastAvailable(t *testing.T) {
 	}
 
 	m := &Manager{
-		totalPieces:   5,
-		peers:         peers,
-		completed:     make([]bool, 5),
-		inProgress:    make(map[uint32]bool),
+		totalPieces: 5,
+		peers:       peers,
+		completed:   make([]bool, 5),
+		inProgress:  make(map[uint32]bool),
 	}
 
 	// Peer 0 has pieces 0,1,2

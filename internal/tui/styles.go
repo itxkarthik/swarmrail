@@ -4,17 +4,14 @@ import "charm.land/lipgloss/v2"
 
 // Colours
 var (
-	indigo      = lipgloss.Color("#7C3AED")
-	indigoDim   = lipgloss.Color("#5B21B6")
-	green       = lipgloss.Color("#22C55E")
-	greenDim    = lipgloss.Color("#166534")
-	amber       = lipgloss.Color("#F59E0B")
-	gray        = lipgloss.Color("#6B7280")
-	grayLight   = lipgloss.Color("#9CA3AF")
-	grayDark    = lipgloss.Color("#374151")
-	grayBg      = lipgloss.Color("#1F2937")
-	white       = lipgloss.Color("#F9FAFB")
-	red         = lipgloss.Color("#EF4444")
+	indigo    = lipgloss.Color("#7C3AED")
+	green     = lipgloss.Color("#22C55E")
+	amber     = lipgloss.Color("#F59E0B")
+	gray      = lipgloss.Color("#6B7280")
+	grayLight = lipgloss.Color("#9CA3AF")
+	grayDark  = lipgloss.Color("#374151")
+	white     = lipgloss.Color("#F9FAFB")
+	red       = lipgloss.Color("#EF4444")
 )
 
 // Styles

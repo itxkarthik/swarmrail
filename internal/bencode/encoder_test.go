@@ -24,7 +24,7 @@ func TestMarshalEmptyString(t *testing.T) {
 
 func TestMarshalIntegerTypes(t *testing.T) {
 	cases := []struct {
-		name string
+		name  string
 		value any
 		want  string
 	}{

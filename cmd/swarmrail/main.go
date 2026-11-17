@@ -114,15 +114,21 @@ func mergeConnectReports(reports ...peer.ConnectReport) peer.ConnectReport {
 }
 
 func run() error {
-	port := flag.Int("port", 6881, "listen port for incoming connections")
-	output := flag.String("output", "", "output directory (default: torrent name)")
+	port := flag.Int("port", 6881, "listen port for incoming connections (0 picks a free port)")
+	output := flag.String("output", "", "output directory (default: current directory)")
 	tuiMode := flag.Bool("tui", false, "terminal UI mode")
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: swarmrail [flags] <torrent-file>")
+		fmt.Fprintln(flag.CommandLine.Output(), "\nFlags:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	ctx, stop := signalNotifyContext(context.Background())
 	defer stop()
 
 	if flag.NArg() < 1 {
-		return fmt.Errorf("Usage: swarmrail [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
+		flag.Usage()
+		return errUsage
 	}
 	if *port < 0 || *port > 65535 {
 		return fmt.Errorf("invalid listen port %d: must be between 0 and 65535", *port)
@@ -399,8 +405,14 @@ func closePeerConnections(peers func() []*peer.PeerConnection) {
 	}
 }
 
+// errUsage reports invalid command-line arguments after usage was printed.
+var errUsage = errors.New("invalid arguments")
+
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errUsage) {
+			os.Exit(2)
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

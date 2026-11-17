@@ -93,7 +93,7 @@ func (t *UDPTracker) ConnectContext(ctx context.Context, addr *net.UDPAddr) (uin
 
 	action := binary.BigEndian.Uint32(buf[0:4])
 	if action == ActionError {
-		return 0, fmt.Errorf("Tracker error %s", string(buf[8:n]))
+		return 0, fmt.Errorf("tracker error: %s", string(buf[8:n]))
 	}
 
 	resp := ConnectionResponse{

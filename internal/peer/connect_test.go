@@ -13,8 +13,8 @@ import (
 
 func TestGeneratePeerID_Length(t *testing.T) {
 	id := GeneratePeerID()
-	if len(id) != 20 {
-		t.Fatalf("expected 20 bytes, got %d", len(id))
+	if id == ([20]byte{}) {
+		t.Fatal("expected a non-zero peer ID")
 	}
 }
 
@@ -41,7 +41,7 @@ func TestGeneratePeerID_Printable(t *testing.T) {
 	id := GeneratePeerID()
 	for i := 8; i < 20; i++ {
 		b := id[i]
-		if !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')) {
+		if (b < 'a' || b > 'z') && (b < '0' || b > '9') {
 			t.Fatalf("byte %d is not alphanumeric: %q (0x%02x)", i, b, b)
 		}
 	}
