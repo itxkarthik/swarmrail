@@ -532,3 +532,46 @@ func TestReaderToleratesKeepAliveOnlyPeerUntilIdleTimeout(t *testing.T) {
 		t.Fatal("silent peer was not dropped after the idle timeout")
 	}
 }
+
+// Requests we cannot serve write nothing, so they must not postpone the
+// keep-alive: a peer sending them faster than the keep-alive interval would
+// otherwise hear nothing from us at all.
+func TestUnservableRequestsDoNotSuppressKeepAlive(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(1, 16384, 16384)
+	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return nil, false })
+	pc.keepAliveInterval = 150 * time.Millisecond
+	pc.Start(nil)
+	defer pc.Close()
+
+	keepAlives := make(chan struct{}, 16)
+	go func() {
+		for {
+			msg, err := ReadMessage(server)
+			if err != nil {
+				return
+			}
+			if msg == nil {
+				keepAlives <- struct{}{}
+			}
+		}
+	}()
+
+	deadline := time.After(600 * time.Millisecond)
+	tick := time.NewTicker(30 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-keepAlives:
+			return
+		case <-tick.C:
+			if err := WriteMessage(server, BuildRequest(0, 0, 16384)); err != nil {
+				t.Fatal(err)
+			}
+		case <-deadline:
+			t.Fatal("no keep-alive while the peer sent requests we could not serve")
+		}
+	}
+}

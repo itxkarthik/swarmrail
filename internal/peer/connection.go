@@ -348,12 +348,20 @@ func (pc *PeerConnection) writer(first *Message) {
 	}
 	keepAlive := time.NewTimer(pc.keepAliveInterval)
 	defer keepAlive.Stop()
+	// write sends one frame and restarts the silence period. Only real
+	// writes restart it: a request we cannot serve writes nothing, so it
+	// must not postpone the keep-alive.
+	write := func(msg *Message) error {
+		if err := pc.writeMessage(msg); err != nil {
+			return err
+		}
+		keepAlive.Reset(pc.keepAliveInterval) // Go 1.23+ timers need no drain
+		return nil
+	}
 	for {
-		// Every case below writes, so the silence period restarts each time.
-		keepAlive.Reset(pc.keepAliveInterval)
 		select {
 		case <-keepAlive.C:
-			if err := pc.writeMessage(nil); err != nil {
+			if err := write(nil); err != nil {
 				return
 			}
 
@@ -364,12 +372,12 @@ func (pc *PeerConnection) writer(first *Message) {
 				continue
 			}
 			msg := BuildPiece(uint32(req.Index), uint32(req.Begin), data)
-			if err := pc.writeMessage(msg); err != nil {
+			if err := write(msg); err != nil {
 				return
 			}
 
 		case msg := <-pc.outgoing:
-			if err := pc.writeMessage(msg); err != nil {
+			if err := write(msg); err != nil {
 				return
 			}
 
