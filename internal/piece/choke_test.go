@@ -337,3 +337,58 @@ func TestNewPeerIsToldAboutPiecesMissingFromItsBitfield(t *testing.T) {
 		}
 	}
 }
+
+// A piece completed by another source while this peer is silent must release
+// the worker at once: it cancels its duplicate requests instead of holding
+// them until the snub timeout.
+func TestWorkerCancelsWhenPieceCompletedElsewhere(t *testing.T) {
+	tf, _ := twoBlockTorrent()
+	pc, remote := newScriptedPeer(t, tf)
+	remote.send(&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}})
+	remote.send(&peer.Message{ID: peer.MsgUnchoke})
+
+	m := NewManager(tf, []*peer.PeerConnection{pc})
+	startDownload(t, m) // default 60 s snub timeout
+
+	for range 2 {
+		if _, ok := remote.nextRequest(2 * time.Second); !ok {
+			t.Fatal("initial requests not sent")
+		}
+	}
+	m.markCompleted(0) // e.g. a webseed finished it; this peer stays silent
+
+	select {
+	case <-remote.cancels:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker kept its requests after the piece completed elsewhere")
+	}
+}
+
+// A choked worker re-evaluates its interest when another source completes
+// the only piece it needed from that peer.
+func TestChokedWorkerDropsInterestWhenNeedCompletedElsewhere(t *testing.T) {
+	tf, _ := twoBlockTorrent()
+	pc, remote := newScriptedPeer(t, tf)
+	remote.send(&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}}) // stays choking
+
+	m := NewManager(tf, []*peer.PeerConnection{pc})
+	startDownload(t, m)
+
+	waitFor := func(want peer.MessageID) {
+		t.Helper()
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case id := <-remote.control:
+				if id == want {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("message %d not sent", want)
+			}
+		}
+	}
+	waitFor(peer.MsgInterested)
+	m.markCompleted(0)
+	waitFor(peer.MsgNotInterested)
+}

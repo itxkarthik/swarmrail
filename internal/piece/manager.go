@@ -63,8 +63,12 @@ type Manager struct {
 
 	requestTimeout time.Duration // snub timeout for outstanding block requests
 
-	mu          sync.Mutex
-	inProgress  map[uint32]bool
+	mu         sync.Mutex
+	inProgress map[uint32]bool
+	// pieceEvents is closed and replaced whenever a piece completes or is
+	// released, waking every worker that might now pick or abandon a piece.
+	// Guarded by mu; read it through pieceEventsChan.
+	pieceEvents chan struct{}
 	transferred atomic.Uint64 // accepted peer/webseed payload bytes, including retries
 
 	// Resume support
@@ -314,17 +318,18 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 		if ctx.Err() != nil {
 			return
 		}
+		events := m.pieceEventsChan() // before reading state, so no event is lost
 		want := m.needsFrom(p)
 		p.SetInterested(want)
 		if !want || p.PeerChoking() {
-			if !waitForStateChange(ctx, p) {
+			if !waitForChange(ctx, p, events) {
 				return
 			}
 			continue
 		}
 		idx := m.nextPiece(p)
 		if idx == -1 {
-			if !waitForStateChange(ctx, p) {
+			if !waitForChange(ctx, p, events) {
 				return
 			}
 			continue
@@ -358,11 +363,15 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 	}
 }
 
-// waitForStateChange blocks until the peer's choke state or availability
+// waitForChange blocks until the peer's choke state or availability changes,
+// or a piece completes or is released elsewhere (which can change what we
+// need from this peer).
 // changes. It returns false when the peer or the download is gone.
-func waitForStateChange(ctx context.Context, p *peer.PeerConnection) bool {
+func waitForChange(ctx context.Context, p *peer.PeerConnection, events <-chan struct{}) bool {
 	select {
 	case <-p.StateChanged():
+		return true
+	case <-events:
 		return true
 	case <-p.Done():
 		return false
@@ -406,6 +415,14 @@ func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx
 
 	timer := time.NewTimer(m.requestTimeout)
 	defer timer.Stop()
+
+	// Another peer or a webseed may complete this piece while this peer is
+	// silent; the event wakes us so the duplicate requests are cancelled
+	// instead of waiting out the snub timeout.
+	events := m.pieceEventsChan()
+	if m.isCompleted(uint32(idx)) {
+		return errPieceDone
+	}
 
 	for remaining > 0 {
 		for ; next < numBlocks && outstanding < peer.MaxPendingRequests; next++ {
@@ -457,6 +474,11 @@ func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx
 			if p.PeerChoking() || p.ChokeCount() != chokes {
 				return errChoked
 			}
+			if m.isCompleted(uint32(idx)) {
+				return errPieceDone
+			}
+		case <-events:
+			events = m.pieceEventsChan()
 			if m.isCompleted(uint32(idx)) {
 				return errPieceDone
 			}
@@ -559,12 +581,35 @@ func (m *Manager) markNotInProgress(index uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inProgress, index)
+	m.notifyPieceEventLocked()
 }
 
 func (m *Manager) markCompleted(index uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completed[index] = true
+	m.notifyPieceEventLocked()
+}
+
+// pieceEventsChan returns a channel that is closed at the next piece
+// completion or release. Take it before checking manager state so an event
+// between the check and the wait is not missed.
+func (m *Manager) pieceEventsChan() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pieceEvents == nil {
+		m.pieceEvents = make(chan struct{})
+	}
+	return m.pieceEvents
+}
+
+// notifyPieceEventLocked wakes every waiter on pieceEventsChan. m.mu must be
+// held.
+func (m *Manager) notifyPieceEventLocked() {
+	if m.pieceEvents != nil {
+		close(m.pieceEvents)
+	}
+	m.pieceEvents = make(chan struct{})
 }
 
 func (m *Manager) isCompleted(index uint32) bool {
@@ -591,6 +636,7 @@ func (m *Manager) SetCompleted(completed []bool) {
 	defer m.mu.Unlock()
 	if len(completed) == len(m.completed) {
 		copy(m.completed, completed)
+		m.notifyPieceEventLocked()
 	}
 }
 
