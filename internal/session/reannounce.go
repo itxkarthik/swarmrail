@@ -45,7 +45,7 @@ func RunPeriodicReannounce(ctx context.Context, config Config) {
 	runPeriodicReannounceWith(
 		ctx, config,
 		func(peers []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
-			return peer.ConnectToPeersWithContext(ctx, config.Torrent, peers, config.PeerID)
+			return peer.ConnectToPeersWithContext(ctx, config.Torrent, peers, config.PeerID, config.Manager.BitfieldMessage)
 		},
 		waitForReannounce,
 	)

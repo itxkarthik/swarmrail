@@ -15,19 +15,19 @@ import (
 // MockTrackerServer is a test HTTP tracker that returns a controlled response.
 type MockTrackerServer struct {
 	Server *httptest.Server
-	URL string
+	URL    string
 	// Configurable responses
-	Peers []Peer
+	Peers    []Peer
 	Interval int
 	// Error injection
-	FailNext bool
+	FailNext   bool
 	FailReason string
 	// Spy: Record what was called
 	LastInfoHash [20]byte
-	LastPeerID [20]byte
-	LastPort int
-	RawQuery string
-	Calls int
+	LastPeerID   [20]byte
+	LastPort     int
+	RawQuery     string
+	Calls        int
 }
 
 // NewMockTrackerServer creates a new MockTrackerServer.
@@ -79,10 +79,10 @@ func (m *MockTrackerServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, _ := bencode.Marshal(map[string]any{
-		"complete": len(m.Peers),
+		"complete":   len(m.Peers),
 		"incomplete": 0,
-		"interval": m.Interval,
-		"peers":    peersBin,
+		"interval":   m.Interval,
+		"peers":      peersBin,
 	})
 	_, err := w.Write(resp)
 	if err != nil {

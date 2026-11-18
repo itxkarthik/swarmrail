@@ -3,6 +3,7 @@ package piece
 import (
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -117,11 +118,12 @@ func LoadVerifiedResume(outputPath string, tf *torrent.TorrentFile) (*ResumeStat
 	}
 
 	report := ResumeReport{}
+	layout := newPayloadLayout(outputPath, tf)
 	for index, complete := range state.Completed {
 		if !complete {
 			continue
 		}
-		data, readErr := readPayloadPiece(outputPath, tf, index)
+		data, readErr := layout.readPiece(index)
 		if readErr != nil || sha1.Sum(data) != tf.PieceHashes[index] {
 			state.Completed[index] = false
 			report.ResetPieces++
@@ -140,60 +142,69 @@ func LoadVerifiedResume(outputPath string, tf *torrent.TorrentFile) (*ResumeStat
 	return state, report, nil
 }
 
-func readPayloadPiece(outputPath string, tf *torrent.TorrentFile, index int) ([]byte, error) {
-	start := int64(index) * tf.PieceLength
-	length := min(tf.PieceLength, tf.Length-start)
+// payloadLayout describes where a torrent's payload lives on disk. Build it
+// once per verification pass: readPiece then only does work for the files a
+// piece actually overlaps, so resuming a many-file torrent stays linear.
+type payloadLayout struct {
+	outputPath string
+	tf         *torrent.TorrentFile
+	lengths    []int64
+}
+
+func newPayloadLayout(outputPath string, tf *torrent.TorrentFile) *payloadLayout {
+	lengths := []int64{tf.Length}
+	if len(tf.Files) > 0 {
+		lengths = make([]int64, len(tf.Files))
+		for i, entry := range tf.Files {
+			lengths[i] = entry.Length
+		}
+	}
+	return &payloadLayout{outputPath: outputPath, tf: tf, lengths: lengths}
+}
+
+// path returns the on-disk path of file i.
+func (l *payloadLayout) path(i int) string {
+	if len(l.tf.Files) == 0 {
+		return filepath.Join(l.outputPath, l.tf.Name)
+	}
+	return filepath.Join(append([]string{l.outputPath, l.tf.Name}, l.tf.Files[i].Path...)...)
+}
+
+func (l *payloadLayout) readPiece(index int) ([]byte, error) {
+	start := int64(index) * l.tf.PieceLength
+	length := min(l.tf.PieceLength, l.tf.Length-start)
 	if length <= 0 {
 		return nil, io.ErrUnexpectedEOF
 	}
 	data := make([]byte, length)
-	if len(tf.Files) == 0 {
-		file, err := os.Open(filepath.Join(outputPath, tf.Name))
-		if err != nil {
+	read := int64(0)
+	for _, s := range fileSpans(l.lengths, start, length) {
+		if err := readFileRange(l.path(s.file), data[s.bufOff:s.bufOff+s.length], s.fileOff); err != nil {
 			return nil, err
 		}
-		defer file.Close()
-		n, err := file.ReadAt(data, start)
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-		if int64(n) != length {
-			return nil, io.ErrUnexpectedEOF
-		}
-		return data, nil
+		read += s.length
 	}
-
-	var torrentOffset int64
-	written := int64(0)
-	for _, entry := range tf.Files {
-		fileStart := torrentOffset
-		fileEnd := fileStart + entry.Length
-		torrentOffset = fileEnd
-		overlapStart := max(start, fileStart)
-		overlapEnd := min(start+length, fileEnd)
-		if overlapStart >= overlapEnd {
-			continue
-		}
-		path := filepath.Join(append([]string{outputPath, tf.Name}, entry.Path...)...)
-		file, err := os.Open(path)
-		if err != nil {
-			return nil, err
-		}
-		partLength := overlapEnd - overlapStart
-		n, readErr := file.ReadAt(data[written:written+partLength], overlapStart-fileStart)
-		file.Close()
-		if readErr != nil && readErr != io.EOF {
-			return nil, readErr
-		}
-		if int64(n) != partLength {
-			return nil, io.ErrUnexpectedEOF
-		}
-		written += partLength
-	}
-	if written != length {
+	if read != length {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return data, nil
+}
+
+// readFileRange fills p from path at off, failing if the file is too short.
+func readFileRange(path string, p []byte, off int64) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	n, err := file.ReadAt(p, off)
+	if n == len(p) {
+		return nil
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // RemoveResume deletes the state file after a successful download.

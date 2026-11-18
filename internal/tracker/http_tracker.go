@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/itxkarthik/swarmrail/internal/bencode"
@@ -38,28 +40,11 @@ func AnnounceHTTPContext(ctx context.Context, announceURL string, infoHash [20]b
 }
 
 func announceHTTP(ctx context.Context, announceURL string, request AnnounceRequest) (AnnounceResponse, error) {
-	// Parse the announce URL
 	parsedURL, err := url.Parse(announceURL)
 	if err != nil {
 		return AnnounceResponse{}, err
 	}
-	// Set the query parameters
-	query := parsedURL.Query()
-	query.Set("info_hash", string(request.InfoHash[:]))
-	query.Set("peer_id", string(request.PeerID[:]))
-	query.Set("port", fmt.Sprintf("%d", request.Port))
-	query.Set("uploaded", fmt.Sprintf("%d", request.Uploaded))
-	query.Set("downloaded", fmt.Sprintf("%d", request.Downloaded))
-	query.Set("left", fmt.Sprintf("%d", request.Left))
-	query.Set("compact", "1")
-	if event := request.Event.HTTPValue(); event != "" {
-		query.Set("event", event)
-	} else {
-		query.Del("event")
-	}
-	// Encode the query parameters and set the URL
-	parsedURL.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, buildAnnounceURL(parsedURL, request), nil)
 	if err != nil {
 		return AnnounceResponse{}, err
 	}
@@ -81,6 +66,91 @@ func announceHTTP(ctx context.Context, announceURL string, request AnnounceReque
 	return parseHTTPResponse(body)
 }
 
+// buildAnnounceURL appends the BEP 3 announce parameters to base.
+//
+// info_hash and peer_id are raw bytes, so they are percent-encoded byte by
+// byte. url.Values would use form encoding and turn 0x20 into '+', which
+// some trackers decode as a literal plus, giving a different infohash. The
+// tracker's own query (often a private passkey) is kept exactly as given
+// rather than parsed and re-encoded, which could reorder or re-escape it.
+func buildAnnounceURL(base *url.URL, request AnnounceRequest) string {
+	key := request.Key
+	if key == 0 {
+		key = sessionKey
+	}
+	params := url.Values{}
+	params.Set("port", strconv.FormatUint(uint64(request.Port), 10))
+	params.Set("uploaded", strconv.FormatUint(request.Uploaded, 10))
+	params.Set("downloaded", strconv.FormatUint(request.Downloaded, 10))
+	params.Set("left", strconv.FormatUint(request.Left, 10))
+	params.Set("compact", "1")
+	params.Set("key", fmt.Sprintf("%08x", key))
+	if event := request.Event.HTTPValue(); event != "" {
+		params.Set("event", event)
+	}
+
+	query := "info_hash=" + escapeBinary(request.InfoHash[:]) +
+		"&peer_id=" + escapeBinary(request.PeerID[:]) +
+		"&" + params.Encode()
+	u := *base
+	if extra := trackerOnlyQuery(u.RawQuery); extra != "" {
+		query = extra + "&" + query
+	}
+	u.RawQuery = query
+	u.Fragment = ""
+	return u.String()
+}
+
+// announceFields are the parameters SwarmRail sets on every announce.
+var announceFields = map[string]bool{
+	"info_hash": true, "peer_id": true, "port": true, "uploaded": true,
+	"downloaded": true, "left": true, "compact": true, "key": true, "event": true,
+}
+
+// trackerOnlyQuery keeps the announce URL's own parameters (a private
+// tracker's passkey, for example) byte for byte, but drops any that
+// SwarmRail sets itself. Otherwise a URL carrying "?event=started" would
+// send a stale first value that many trackers read instead of ours.
+func trackerOnlyQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	kept := make([]string, 0, strings.Count(raw, "&")+1)
+	for pair := range strings.SplitSeq(raw, "&") {
+		if pair == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(pair, "=")
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if announceFields[name] {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	return strings.Join(kept, "&")
+}
+
+// escapeBinary percent-encodes every byte outside the RFC 3986 unreserved
+// set (ALPHA / DIGIT / "-" / "." / "_" / "~").
+func escapeBinary(b []byte) string {
+	const hex = "0123456789ABCDEF"
+	var sb strings.Builder
+	sb.Grow(len(b) * 3)
+	for _, c := range b {
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' ||
+			c == '-' || c == '.' || c == '_' || c == '~' {
+			sb.WriteByte(c)
+			continue
+		}
+		sb.WriteByte('%')
+		sb.WriteByte(hex[c>>4])
+		sb.WriteByte(hex[c&0x0F])
+	}
+	return sb.String()
+}
+
 // parseHTTPResponse parses the HTTP response body and returns a list of peers.
 func parseHTTPResponse(body []byte) (AnnounceResponse, error) {
 	// Decode the response body
@@ -95,7 +165,7 @@ func parseHTTPResponse(body []byte) (AnnounceResponse, error) {
 		return AnnounceResponse{}, fmt.Errorf("invalid tracker response: expected dict")
 	}
 	if failure, ok := top["failure reason"].(string); ok {
-		return AnnounceResponse{}, fmt.Errorf("tracker failure: %s", failure)
+		return AnnounceResponse{}, fmt.Errorf("tracker failure: %s", sanitizeTrackerText([]byte(failure)))
 	}
 
 	// Check for peers in the response

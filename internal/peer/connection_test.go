@@ -18,7 +18,7 @@ func TestNewPeerConnection(t *testing.T) {
 	if pc == nil {
 		t.Fatal("NewPeerConnection returned nil")
 	}
-	if pc.choked.Load() != true {
+	if pc.PeerChoking() != true {
 		t.Fatal("expected PeerConnection to start choked")
 	}
 	if pc.peerID != peerID {
@@ -35,7 +35,7 @@ func TestPeerConnection_StartClose(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 
 	// Give goroutines time to start
 	time.Sleep(50 * time.Millisecond)
@@ -54,7 +54,7 @@ func TestPeerConnection_StartBeforeClose(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
 	// Connection should be alive
@@ -72,7 +72,9 @@ func TestPeerConnection_ReaderReceivesMessage(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.ConfigureTorrent(50, 16384, 50*16384)
+	pc.SetBitfield(make([]bool, 50))
+	pc.Start(nil)
 	defer pc.Close()
 
 	// Send a Have message through conn2 (the mock peer side)
@@ -81,17 +83,19 @@ func TestPeerConnection_ReaderReceivesMessage(t *testing.T) {
 		t.Fatalf("WriteMessage error: %v", err)
 	}
 
-	// Read it from the Incoming channel
+	// Have is folded into connection state, not forwarded to Incoming.
+	select {
+	case <-pc.StateChanged():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for state change after Have")
+	}
+	if !pc.Bitfield()[42] {
+		t.Fatal("Have did not mark piece 42 as available")
+	}
 	select {
 	case got := <-pc.Incoming():
-		if got.ID != MsgHave {
-			t.Fatalf("expected MsgHave (4), got %d", got.ID)
-		}
-		if len(got.Payload) != 4 || got.Payload[3] != 42 {
-			t.Fatalf("unexpected payload: %v", got.Payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message on Incoming channel")
+		t.Fatalf("Have was forwarded to Incoming: %+v", got)
+	default:
 	}
 }
 
@@ -104,10 +108,10 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to start choked")
 	}
 
@@ -119,7 +123,7 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 	// Give the reader time to process and update state
 	time.Sleep(100 * time.Millisecond)
 
-	if pc.choked.Load() {
+	if pc.PeerChoking() {
 		t.Fatal("expected to be unchoked after receiving unchoke message")
 	}
 
@@ -130,7 +134,7 @@ func TestPeerConnection_ReaderHandlesChoke(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to be choked after receiving choke message")
 	}
 }
@@ -144,10 +148,10 @@ func TestPeerConnection_ReaderHandlesUnchoke(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
-	if !pc.choked.Load() {
+	if !pc.PeerChoking() {
 		t.Fatal("expected to start choked")
 	}
 
@@ -158,18 +162,15 @@ func TestPeerConnection_ReaderHandlesUnchoke(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if pc.choked.Load() {
+	if pc.PeerChoking() {
 		t.Fatal("expected to be unchoked")
 	}
 
-	// Verify the message was also delivered on Incoming
+	// The unchoke is signalled as a state change.
 	select {
-	case got := <-pc.Incoming():
-		if got.ID != MsgUnchoke {
-			t.Fatalf("expected MsgUnchoke (1), got %d", got.ID)
-		}
+	case <-pc.StateChanged():
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for unchoke on Incoming channel")
+		t.Fatal("timeout waiting for unchoke state change")
 	}
 }
 
@@ -182,7 +183,8 @@ func TestPeerConnection_ReaderKeepalive(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.ConfigureTorrent(2, 16384, 2*16384)
+	pc.Start(nil)
 	defer pc.Close()
 
 	// Send keep-alive (length=0)
@@ -199,16 +201,13 @@ func TestPeerConnection_ReaderKeepalive(t *testing.T) {
 	}
 
 	select {
-	case got := <-pc.Incoming():
-		if got.ID != MsgHave {
-			t.Fatalf("expected MsgHave after keep-alive, got %d", got.ID)
-		}
+	case <-pc.StateChanged():
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout — reader likely stalled after keep-alive")
 	}
 }
 
-func TestPeerConnection_AssignWorkWhenChoked(t *testing.T) {
+func TestPeerConnection_RequestWhenChoked(t *testing.T) {
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -217,17 +216,16 @@ func TestPeerConnection_AssignWorkWhenChoked(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
-	// Should not accept work when choked
-	ok := pc.AssignWork(PieceWork{Index: 5, Begin: 0, Length: 16384})
-	if ok {
-		t.Fatal("AssignWork should return false when choked")
+	// Should not send requests while choked
+	if pc.Request(PieceWork{Index: 5, Begin: 0, Length: 16384}) {
+		t.Fatal("Request should return false when choked")
 	}
 }
 
-func TestPeerConnection_AssignWorkWhenUnchoked(t *testing.T) {
+func TestPeerConnection_RequestWhenUnchoked(t *testing.T) {
 	conn1, conn2 := net.Pipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -236,7 +234,7 @@ func TestPeerConnection_AssignWorkWhenUnchoked(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
 	// Send unchoke
@@ -245,10 +243,10 @@ func TestPeerConnection_AssignWorkWhenUnchoked(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Should accept work now
-	ok := pc.AssignWork(PieceWork{Index: 5, Begin: 0, Length: 16384})
-	if !ok {
-		t.Fatal("AssignWork should return true when unchoked")
+	// Should send requests now
+	go func() { _, _ = ReadMessage(conn2) }()
+	if !pc.Request(PieceWork{Index: 5, Begin: 0, Length: 16384}) {
+		t.Fatal("Request should return true when unchoked")
 	}
 }
 
@@ -261,7 +259,7 @@ func TestPeerConnection_SetAndGetBitfield(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 	defer pc.Close()
 
 	bitfield := []bool{true, false, true, true, false}
@@ -287,7 +285,7 @@ func TestPeerConnection_CloseTwice(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 
 	// Close twice — must not panic
 	pc.Close()
@@ -301,7 +299,7 @@ func TestPeerConnection_ReaderStopsOnClose(t *testing.T) {
 	copy(peerID[:], []byte("testpeerid12345678"))
 
 	pc := NewPeerConnection(conn1, peerID)
-	pc.Start()
+	pc.Start(nil)
 
 	// Close the connection — reader should notice and exit
 	conn2.Close()
@@ -319,7 +317,7 @@ func TestPeerConnectionCountsSuccessfullyUploadedPayload(t *testing.T) {
 	pc := NewInboundPeerConnection(client, [20]byte{1})
 	pc.ConfigureTorrent(1, 4, 4)
 	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return []byte("data"), true })
-	pc.Start()
+	pc.Start(nil)
 	if err := WriteMessage(server, BuildRequest(0, 0, 4)); err != nil {
 		t.Fatal(err)
 	}
@@ -346,12 +344,12 @@ func TestPeerConnectionTracksLateBitfieldAndSignalsAvailability(t *testing.T) {
 	pc := NewInboundPeerConnection(client, [20]byte{1})
 	pc.ConfigureTorrent(2, 4, 8)
 	pc.SetBitfield(make([]bool, 2))
-	pc.Start()
+	pc.Start(nil)
 	if err := WriteMessage(server, &Message{ID: MsgBitfield, Payload: []byte{0b10000000}}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-pc.AvailabilityChanged():
+	case <-pc.StateChanged():
 	case <-time.After(time.Second):
 		t.Fatal("late bitfield did not signal availability")
 	}
@@ -359,4 +357,221 @@ func TestPeerConnectionTracksLateBitfieldAndSignalsAvailability(t *testing.T) {
 		t.Fatalf("bitfield = %v, want [true false]", bits)
 	}
 	pc.Close()
+}
+
+// An idle worker never reads Incoming. Before the fix, the reader forwarded
+// every Have to Incoming, blocked once its 100-slot buffer filled, and then
+// stopped reading upload requests too.
+func TestReaderKeepsServingRequestsAfterManyHaves(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	const pieces = 300
+	pc := NewInboundPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(pieces, 4, pieces*4)
+	pc.SetBitfield(make([]bool, pieces))
+	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return []byte("data"), true })
+	pc.Start(nil)
+	defer pc.Close()
+
+	go func() {
+		for i := range uint32(200) {
+			if err := WriteMessage(server, BuildHave(i)); err != nil {
+				return
+			}
+		}
+		_ = WriteMessage(server, BuildRequest(0, 0, 4))
+	}()
+
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msg, err := ReadMessage(server)
+	if err != nil {
+		t.Fatalf("no reply to request after 200 Have messages: %v", err)
+	}
+	if msg.ID != MsgPiece {
+		t.Fatalf("reply ID = %d, want piece", msg.ID)
+	}
+	if got := pc.Bitfield(); !got[0] || !got[199] || got[200] {
+		t.Fatal("Have messages were not applied to the bitfield")
+	}
+}
+
+func TestStartWritesFirstMessageBeforeQueuedMessages(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(8, 4, 32)
+	defer pc.Close()
+
+	// Queue a message before Start, the way a caller racing with the
+	// connection setup might.
+	pc.SetInterested(true)
+	pc.Start(&Message{ID: MsgBitfield, Payload: []byte{0x80}})
+
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	first, err := ReadMessage(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != MsgBitfield {
+		t.Fatalf("first message ID = %d, want bitfield", first.ID)
+	}
+	second, err := ReadMessage(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != MsgInterested {
+		t.Fatalf("second message ID = %d, want interested", second.ID)
+	}
+}
+
+func TestLateBitfieldClosesConnection(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(8, 4, 32)
+	pc.SetBitfield(make([]bool, 8))
+	pc.Start(nil)
+	defer pc.Close()
+
+	if err := WriteMessage(server, &Message{ID: MsgUnchoke}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMessage(server, &Message{ID: MsgBitfield, Payload: []byte{0xFF}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pc.Done():
+	case <-time.After(time.Second):
+		t.Fatal("connection stayed open after a bitfield that was not the first message")
+	}
+}
+
+func TestSetInterestedSendsOnlyOnChange(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.Start(nil)
+	defer pc.Close()
+
+	got := make(chan MessageID, 8)
+	go func() {
+		for {
+			msg, err := ReadMessage(server)
+			if err != nil {
+				return
+			}
+			got <- msg.ID
+		}
+	}()
+
+	pc.SetInterested(false) // already not interested: nothing sent
+	pc.SetInterested(true)
+	pc.SetInterested(true)
+	pc.SetInterested(false)
+
+	for _, want := range []MessageID{MsgInterested, MsgNotInterested} {
+		select {
+		case id := <-got:
+			if id != want {
+				t.Fatalf("message ID = %d, want %d", id, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for message %d", want)
+		}
+	}
+	select {
+	case id := <-got:
+		t.Fatalf("unexpected extra message %d", id)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWriterSendsKeepAliveWhenIdle(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.keepAliveInterval = 50 * time.Millisecond
+	pc.Start(nil)
+	defer pc.Close()
+
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	for range 2 {
+		msg, err := ReadMessage(server)
+		if err != nil {
+			t.Fatalf("no keep-alive from idle writer: %v", err)
+		}
+		if msg != nil {
+			t.Fatalf("got message %d, want keep-alive", msg.ID)
+		}
+	}
+}
+
+func TestReaderToleratesKeepAliveOnlyPeerUntilIdleTimeout(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.idleTimeout = 150 * time.Millisecond
+	pc.keepAliveInterval = time.Hour
+	pc.Start(nil)
+	defer pc.Close()
+
+	// A choking peer that only sends keep-alives stays connected...
+	for range 8 {
+		if _, err := server.Write(make([]byte, 4)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !pc.Active() {
+		t.Fatal("connection closed while the peer was sending keep-alives")
+	}
+	// ...and is dropped once it goes completely silent.
+	select {
+	case <-pc.Done():
+	case <-time.After(time.Second):
+		t.Fatal("silent peer was not dropped after the idle timeout")
+	}
+}
+
+// Requests we cannot serve write nothing, so they must not postpone the
+// keep-alive: a peer sending them faster than the keep-alive interval would
+// otherwise hear nothing from us at all.
+func TestUnservableRequestsDoNotSuppressKeepAlive(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	pc := NewPeerConnection(client, [20]byte{1})
+	pc.ConfigureTorrent(1, 16384, 16384)
+	pc.SetPieceDataHandler(func(PieceWork) ([]byte, bool) { return nil, false })
+	pc.keepAliveInterval = 150 * time.Millisecond
+	pc.Start(nil)
+	defer pc.Close()
+
+	keepAlives := make(chan struct{}, 16)
+	go func() {
+		for {
+			msg, err := ReadMessage(server)
+			if err != nil {
+				return
+			}
+			if msg == nil {
+				keepAlives <- struct{}{}
+			}
+		}
+	}()
+
+	deadline := time.After(600 * time.Millisecond)
+	tick := time.NewTicker(30 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-keepAlives:
+			return
+		case <-tick.C:
+			if err := WriteMessage(server, BuildRequest(0, 0, 16384)); err != nil {
+				t.Fatal(err)
+			}
+		case <-deadline:
+			t.Fatal("no keep-alive while the peer sent requests we could not serve")
+		}
+	}
 }

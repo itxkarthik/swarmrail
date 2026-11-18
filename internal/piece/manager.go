@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/itxkarthik/swarmrail/internal/peer"
 	"github.com/itxkarthik/swarmrail/internal/torrent"
@@ -59,8 +61,14 @@ type Manager struct {
 	outputName   string              // torrent name for output files
 	files        []torrent.FileEntry // multi-file entries (nil for single-file)
 
-	mu          sync.Mutex
-	inProgress  map[uint32]bool
+	requestTimeout time.Duration // snub timeout for outstanding block requests
+
+	mu         sync.Mutex
+	inProgress map[uint32]bool
+	// pieceEvents is closed and replaced whenever a piece completes or is
+	// released, waking every worker that might now pick or abandon a piece.
+	// Guarded by mu; read it through pieceEventsChan.
+	pieceEvents chan struct{}
 	transferred atomic.Uint64 // accepted peer/webseed payload bytes, including retries
 
 	// Resume support
@@ -80,18 +88,19 @@ type Manager struct {
 // NewManager creates a Manager ready to start downloading.
 func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Manager {
 	return &Manager{
-		totalPieces:  len(torrent.PieceHashes),
-		pieceLength:  uint64(torrent.PieceLength),
-		totalLength:  uint64(torrent.Length),
-		pieceHashes:  torrent.PieceHashes,
-		peers:        peers,
-		webseeds:     webseed.NewSources(torrent),
-		outputName:   torrent.Name,
-		files:        torrent.Files,
-		completed:    make([]bool, len(torrent.PieceHashes)),
-		pieceResults: make(chan PieceResult, 32),
-		inProgress:   make(map[uint32]bool),
-		logWriter:    os.Stderr,
+		totalPieces:    len(torrent.PieceHashes),
+		pieceLength:    uint64(torrent.PieceLength),
+		totalLength:    uint64(torrent.Length),
+		pieceHashes:    torrent.PieceHashes,
+		peers:          peers,
+		webseeds:       webseed.NewSources(torrent),
+		outputName:     torrent.Name,
+		files:          torrent.Files,
+		completed:      make([]bool, len(torrent.PieceHashes)),
+		pieceResults:   make(chan PieceResult, 32),
+		inProgress:     make(map[uint32]bool),
+		requestTimeout: defaultRequestTimeout,
+		logWriter:      os.Stderr,
 	}
 }
 
@@ -222,15 +231,44 @@ func (m *Manager) Download(parent context.Context, outputPath string, resume boo
 	return nil
 }
 
+// initPeerUpload prepares a connection that has just joined m.peers. It must
+// run after the peer is in m.peers: pieces completed from then on reach it
+// through announceHave, and pieces completed earlier, after its bitfield was
+// captured at connect time, are announced here. Overlap only produces a
+// harmless duplicate Have.
 func (m *Manager) initPeerUpload(p *peer.PeerConnection) {
 	p.ConfigureTorrent(m.totalPieces, int64(m.pieceLength), int64(m.totalLength))
 	p.SetPieceDataHandler(m.readUploadBlock)
-
-	bitfieldBytes := peer.BuildBitfieldBytes(m.Completed())
-	// Send our bitfield so the peer knows what we have.
-	if len(bitfieldBytes) > 0 {
-		p.SendBitfield(bitfieldBytes)
+	for i, done := range m.Completed() {
+		if done && !p.AdvertisedHas(i) {
+			p.SendHave(uint32(i))
+		}
 	}
+}
+
+// BitfieldMessage returns our bitfield as the first message to send on a new
+// connection, or nil when we have no verified pieces (the bitfield is then
+// optional under BEP 3).
+func (m *Manager) BitfieldMessage() *peer.Message {
+	completed := m.Completed()
+	if CountCompleted(completed) == 0 {
+		return nil
+	}
+	return &peer.Message{ID: peer.MsgBitfield, Payload: peer.BuildBitfieldBytes(completed)}
+}
+
+// needsFrom reports whether p has at least one piece we have not verified,
+// which is when BEP 3 says we should be interested in it.
+func (m *Manager) needsFrom(p *peer.PeerConnection) bool {
+	bf := p.Bitfield()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, has := range bf {
+		if has && i < len(m.completed) && !m.completed[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) readUploadBlock(work peer.PieceWork) ([]byte, bool) {
@@ -245,7 +283,7 @@ func (m *Manager) readUploadBlock(work peer.PieceWork) ([]byte, bool) {
 		return nil, false
 	}
 	data := make([]byte, work.Length)
-	n, err := pw.ReadPiece(uint32(work.Index), data)
+	n, err := pw.ReadBlock(uint32(work.Index), uint32(work.Begin), data)
 	return data, err == nil && n == len(data)
 }
 
@@ -270,52 +308,47 @@ func (m *Manager) nextPiece(p *peer.PeerConnection) int {
 	return m.FirstPiece(p)
 }
 
-// worker selects pieces for its peer via nextPiece, then downloads all
-// blocks of each piece. It requests all blocks of a piece at once
-// (pipelining), collects the responses, verifies the SHA1 hash, and
-// sends the verified piece to pieceResults. On corruption it loops
-// back to re-select the piece; on disconnection it exits so the peer's
-// in-progress pieces become available to other workers.
+// worker downloads pieces from one peer until the download ends or the peer
+// disconnects. Choke, snub and duplicate completion are normal events: the
+// worker releases its piece and picks again instead of exiting, so a peer that
+// unchokes late or re-chokes during rotation keeps contributing.
 func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
+	defer p.CancelPending()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
+		}
+		events := m.pieceEventsChan() // before reading state, so no event is lost
+		want := m.needsFrom(p)
+		p.SetInterested(want)
+		if !want || p.PeerChoking() {
+			if !waitForChange(ctx, p, events) {
+				return
+			}
+			continue
 		}
 		idx := m.nextPiece(p)
 		if idx == -1 {
-			select {
-			case <-ctx.Done():
+			if !waitForChange(ctx, p, events) {
 				return
-			case <-p.Done():
-				return
-			case <-p.AvailabilityChanged():
-				continue
 			}
+			continue
 		}
-
-		pieceSize := m.sizeOfPiece(idx)
-		numBlocks := int((pieceSize + blockSize - 1) / blockSize)
-		pieceData := make([]byte, pieceSize)
 
 		m.markInProgress(uint32(idx))
-
-		// Pipeline: send all block requests for this piece to the peer.
-		ok := m.sendBlockRequests(p, idx, numBlocks, pieceSize)
-		if !ok {
+		pieceData := make([]byte, m.sizeOfPiece(idx))
+		err := m.downloadPiece(ctx, p, idx, pieceData)
+		switch {
+		case err == nil:
+		case errors.Is(err, errChoked), errors.Is(err, errSnubbed), errors.Is(err, errPieceDone):
+			p.CancelPending()
 			m.markNotInProgress(uint32(idx))
-			return // peer choked or disconnected
+			continue
+		default: // peer closed or download cancelled
+			m.markNotInProgress(uint32(idx))
+			return
 		}
 
-		// Collect all block responses.
-		ok = m.collectBlocks(p, idx, pieceData, numBlocks)
-		if !ok {
-			m.markNotInProgress(uint32(idx))
-			return // peer disconnected mid-piece
-		}
-
-		// Verify SHA1 hash.
 		if !m.verifyPiece(uint32(idx), pieceData) {
 			m.markNotInProgress(uint32(idx))
 			continue
@@ -328,6 +361,136 @@ func (m *Manager) worker(ctx context.Context, p *peer.PeerConnection) {
 			return
 		}
 	}
+}
+
+// waitForChange blocks until the peer's choke state or availability changes,
+// or a piece completes or is released elsewhere (which can change what we
+// need from this peer).
+// changes. It returns false when the peer or the download is gone.
+func waitForChange(ctx context.Context, p *peer.PeerConnection, events <-chan struct{}) bool {
+	select {
+	case <-p.StateChanged():
+		return true
+	case <-events:
+		return true
+	case <-p.Done():
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+var (
+	errChoked     = errors.New("peer choked us")
+	errSnubbed    = errors.New("peer sent no requested data in time")
+	errPieceDone  = errors.New("piece completed by another source")
+	errPeerClosed = errors.New("peer connection closed")
+)
+
+// defaultRequestTimeout is how long a worker waits for any requested block
+// before treating the peer as snubbing it and releasing the piece.
+const defaultRequestTimeout = 60 * time.Second
+
+// downloadPiece fills pieceData with piece idx from p, keeping up to
+// peer.MaxPendingRequests block requests in flight.
+func (m *Manager) downloadPiece(ctx context.Context, p *peer.PeerConnection, idx int, pieceData []byte) error {
+	// Discard blocks left over from an abandoned piece before counting
+	// replies for this one.
+	for drained := false; !drained; {
+		select {
+		case <-p.Incoming():
+		default:
+			drained = true
+		}
+	}
+
+	// Any choke after this point discards requests sent for this piece, even
+	// if an unchoke follows before this worker wakes up.
+	chokes := p.ChokeCount()
+
+	numBlocks := (len(pieceData) + blockSize - 1) / blockSize
+	requested := make([]bool, numBlocks)
+	received := make([]bool, numBlocks)
+	next, outstanding, remaining := 0, 0, numBlocks
+
+	timer := time.NewTimer(m.requestTimeout)
+	defer timer.Stop()
+
+	// Another peer or a webseed may complete this piece while this peer is
+	// silent; the event wakes us so the duplicate requests are cancelled
+	// instead of waiting out the snub timeout.
+	events := m.pieceEventsChan()
+	if m.isCompleted(uint32(idx)) {
+		return errPieceDone
+	}
+
+	for remaining > 0 {
+		for ; next < numBlocks && outstanding < peer.MaxPendingRequests; next++ {
+			if received[next] {
+				continue
+			}
+			begin := next * blockSize
+			length := min(blockSize, len(pieceData)-begin)
+			if p.ChokeCount() != chokes {
+				return errChoked
+			}
+			if !p.Request(peer.PieceWork{Index: idx, Begin: begin, Length: length}) {
+				if p.PeerChoking() {
+					return errChoked
+				}
+				if !p.Active() {
+					return errPeerClosed
+				}
+				break // pending cap reached; wait for replies
+			}
+			requested[next] = true
+			outstanding++
+		}
+
+		select {
+		case msg := <-p.Incoming():
+			if len(msg.Payload) < 8 || binary.BigEndian.Uint32(msg.Payload[0:4]) != uint32(idx) {
+				continue // reply for a piece this worker gave up on
+			}
+			begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+			block := msg.Payload[8:]
+			b := begin / blockSize
+			if begin%blockSize != 0 || b >= numBlocks || received[b] ||
+				len(block) != min(blockSize, len(pieceData)-begin) {
+				continue
+			}
+			copy(pieceData[begin:], block)
+			received[b] = true
+			remaining--
+			if requested[b] {
+				outstanding--
+			}
+			m.transferred.Add(uint64(len(block)))
+			timer.Reset(m.requestTimeout) // Go 1.23+ timers need no drain before Reset
+			if remaining > 0 && m.isCompleted(uint32(idx)) {
+				return errPieceDone
+			}
+		case <-p.StateChanged():
+			if p.PeerChoking() || p.ChokeCount() != chokes {
+				return errChoked
+			}
+			if m.isCompleted(uint32(idx)) {
+				return errPieceDone
+			}
+		case <-events:
+			events = m.pieceEventsChan()
+			if m.isCompleted(uint32(idx)) {
+				return errPieceDone
+			}
+		case <-timer.C:
+			return errSnubbed
+		case <-p.Done():
+			return errPeerClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (m *Manager) webseedWorker(ctx context.Context, source webseed.Source) {
@@ -393,101 +556,6 @@ func (m *Manager) nextWebSeedPiece() int {
 	return bestStart
 }
 
-// sendBlockRequests sends all block requests for the given piece to the peer.
-// Returns false if the peer can't accept any request (choked/disconnected).
-func (m *Manager) sendBlockRequests(p *peer.PeerConnection, idx, numBlocks int, pieceSize uint64) bool {
-	for b := range numBlocks {
-		begin := int64(b) * blockSize
-		length := int64(blockSize)
-		if begin+length > int64(pieceSize) {
-			length = int64(pieceSize) - begin
-		}
-
-		ok := p.AssignWork(peer.PieceWork{
-			Index:  int(idx),
-			Begin:  int(begin),
-			Length: int(length),
-		})
-		if !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// collectBlocks reads responses from the peer until all blocks of the piece
-// are received. Returns false if the peer disconnects before completion.
-// In endgame mode, another peer may complete the same piece while we're
-// collecting — if m.completed[idx] becomes true, we exit early.
-func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byte, numBlocks int) bool {
-	received := make(map[uint32]bool, numBlocks)
-	for remaining := numBlocks; remaining > 0; {
-		if m.isCompleted(uint32(idx)) {
-			return false
-		}
-
-		msg := m.waitForPieceMessage(p)
-		if msg == nil {
-			return false
-		}
-
-		if len(msg.Payload) < 8 {
-			return false
-		}
-		msgIndex := binary.BigEndian.Uint32(msg.Payload[0:4])
-		if msgIndex != uint32(idx) {
-			return false
-		}
-		begin := binary.BigEndian.Uint32(msg.Payload[4:8])
-		blockData := msg.Payload[8:]
-		if int(begin) >= len(pieceData) || int(begin)+len(blockData) > len(pieceData) {
-			return false
-		}
-		if begin%blockSize != 0 {
-			return false
-		}
-		if received[begin] {
-			continue
-		}
-		expected := blockSize
-		if int(begin)+expected > len(pieceData) {
-			expected = len(pieceData) - int(begin)
-		}
-		if len(blockData) != expected {
-			return false
-		}
-		copy(pieceData[begin:], blockData)
-		received[begin] = true
-		m.transferred.Add(uint64(len(blockData)))
-		remaining--
-	}
-	return true
-}
-
-// waitForPieceMessage reads from the peer's Incoming channel until a MsgPiece
-// is received, tracking Have messages along the way. Returns nil if the peer
-// disconnects before delivering the piece.
-func (m *Manager) waitForPieceMessage(p *peer.PeerConnection) *peer.Message {
-	for {
-		select {
-		case msg, ok := <-p.Incoming():
-			if !ok {
-				return nil
-			}
-			if msg.ID == peer.MsgPiece {
-				return msg
-			}
-			// Track have messages to keep bitfield current.
-			if msg.ID == peer.MsgHave && len(msg.Payload) == 4 {
-				idx := binary.BigEndian.Uint32(msg.Payload)
-				p.MarkPieceAvailable(idx)
-			}
-		case <-p.Done():
-			return nil
-		}
-	}
-}
-
 // verifyPiece checks the assembled piece data against the expected SHA1 hash.
 func (m *Manager) verifyPiece(index uint32, data []byte) bool {
 	hash := sha1.Sum(data)
@@ -513,12 +581,35 @@ func (m *Manager) markNotInProgress(index uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inProgress, index)
+	m.notifyPieceEventLocked()
 }
 
 func (m *Manager) markCompleted(index uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completed[index] = true
+	m.notifyPieceEventLocked()
+}
+
+// pieceEventsChan returns a channel that is closed at the next piece
+// completion or release. Take it before checking manager state so an event
+// between the check and the wait is not missed.
+func (m *Manager) pieceEventsChan() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pieceEvents == nil {
+		m.pieceEvents = make(chan struct{})
+	}
+	return m.pieceEvents
+}
+
+// notifyPieceEventLocked wakes every waiter on pieceEventsChan. m.mu must be
+// held.
+func (m *Manager) notifyPieceEventLocked() {
+	if m.pieceEvents != nil {
+		close(m.pieceEvents)
+	}
+	m.pieceEvents = make(chan struct{})
 }
 
 func (m *Manager) isCompleted(index uint32) bool {
@@ -545,6 +636,7 @@ func (m *Manager) SetCompleted(completed []bool) {
 	defer m.mu.Unlock()
 	if len(completed) == len(m.completed) {
 		copy(m.completed, completed)
+		m.notifyPieceEventLocked()
 	}
 }
 

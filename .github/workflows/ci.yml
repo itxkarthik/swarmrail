@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # Each fuzz target gets a short run on every change; run them longer
+      # locally with -fuzztime when touching a parser.
+      - name: fuzz
+        run: |
+          set -e
+          for target in \
+            bencode:FuzzDecode \
+            torrent:FuzzParse \
+            peer:FuzzReadMessage \
+            tracker:FuzzParseHTTPResponse \
+            tracker:FuzzParseUDPAnnounce; do
+            pkg="${target%%:*}"
+            name="${target##*:}"
+            go test "./internal/$pkg" -run '^$' -fuzz "^${name}\$" -fuzztime=20s
+          done

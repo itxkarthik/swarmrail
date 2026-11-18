@@ -1,145 +1,184 @@
 package bencode
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 )
 
+// MaxDepth is the deepest list/dictionary nesting Decode accepts. Real
+// torrents, tracker replies and extension messages nest only a few levels;
+// the limit stops crafted input from exhausting the goroutine stack.
+const MaxDepth = 64
+
+// Errors returned for malformed input. Callers can match them with errors.Is.
+var (
+	ErrSyntax       = errors.New("bencode: syntax error")
+	ErrNonCanonical = errors.New("bencode: non-canonical encoding")
+	ErrTooDeep      = errors.New("bencode: nesting too deep")
+)
+
 // Decode parses a single bencoded value from data and returns:
-//   - the decoded value (int64 for integers, string for strings, []interface{} for lists, map[string]interface{} for dictionaries)
+//   - the decoded value (int64 for integers, string for strings, []any for
+//     lists, map[string]any for dictionaries)
 //   - the remaining unconsumed bytes
 //   - any error encountered
+//
+// Input is treated as untrusted: lengths are checked without overflow,
+// non-canonical integers and string lengths are rejected, and nesting is
+// limited to MaxDepth.
 func Decode(data []byte) (any, []byte, error) {
+	return decode(data, 0)
+}
+
+func decode(data []byte, depth int) (any, []byte, error) {
 	if len(data) == 0 {
-		return nil, data, fmt.Errorf("empty input")
+		return nil, data, fmt.Errorf("%w: empty input", ErrSyntax)
 	}
-	switch {
-	case data[0] == 'i':
+	switch c := data[0]; {
+	case c == 'i':
 		return decodeInteger(data)
-	case data[0] >= '0' && data[0] <= '9':
+	case c >= '0' && c <= '9':
 		return decodeString(data)
-	case data[0] == 'l':
-		return decodeList(data)
-	case data[0] == 'd':
-		return decodeDict(data)
+	case c == 'l':
+		return decodeList(data, depth+1)
+	case c == 'd':
+		return decodeDict(data, depth+1)
 	default:
-		return nil, data, fmt.Errorf("unknown type: %c", data[0])
+		return nil, data, fmt.Errorf("%w: unknown type %q", ErrSyntax, c)
 	}
 }
 
 // decodeInteger decodes a bencode integer in the form i<number>e.
 func decodeInteger(data []byte) (any, []byte, error) {
-	// data[0] is 'i', find the closing 'e'
 	end := 1
 	for end < len(data) && data[end] != 'e' {
 		end++
 	}
 	if end >= len(data) {
-		return nil, data, fmt.Errorf("invalid integer: missing 'e'")
+		return nil, data, fmt.Errorf("%w: integer missing 'e'", ErrSyntax)
 	}
 
-	// Parse the number portion (data[1:end])
-	n, err := strconv.ParseInt(string(data[1:end]), 10, 64)
+	num := data[1:end]
+	if err := checkCanonicalInteger(num); err != nil {
+		return nil, data, err
+	}
+	n, err := strconv.ParseInt(string(num), 10, 64)
 	if err != nil {
-		return nil, data, fmt.Errorf("invalid integer: %v", err)
+		return nil, data, fmt.Errorf("%w: invalid integer %q", ErrSyntax, num)
 	}
-
 	return n, data[end+1:], nil
+}
+
+// checkCanonicalInteger enforces BEP 3: digits only with an optional leading
+// '-', no leading zeros, and no negative zero.
+func checkCanonicalInteger(num []byte) error {
+	digits := num
+	if len(digits) > 0 && digits[0] == '-' {
+		digits = digits[1:]
+		if len(digits) > 0 && digits[0] == '0' {
+			return fmt.Errorf("%w: integer %q", ErrNonCanonical, num)
+		}
+	}
+	if len(digits) == 0 {
+		return fmt.Errorf("%w: empty integer", ErrSyntax)
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("%w: invalid integer %q", ErrSyntax, num)
+		}
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		return fmt.Errorf("%w: integer %q", ErrNonCanonical, num)
+	}
+	return nil
 }
 
 // decodeString decodes a bencode string in the form <length>:<content>.
 func decodeString(data []byte) (any, []byte, error) {
-	// Find the ':'
 	colon := 0
 	for colon < len(data) && data[colon] != ':' {
+		if data[colon] < '0' || data[colon] > '9' {
+			return nil, data, fmt.Errorf("%w: invalid string length", ErrSyntax)
+		}
 		colon++
 	}
 	if colon >= len(data) {
-		return nil, data, fmt.Errorf("invalid string: missing ':'")
+		return nil, data, fmt.Errorf("%w: string missing ':'", ErrSyntax)
+	}
+	if colon > 1 && data[0] == '0' {
+		return nil, data, fmt.Errorf("%w: string length %q", ErrNonCanonical, data[:colon])
 	}
 
-	// Parse the length
 	length, err := strconv.Atoi(string(data[:colon]))
 	if err != nil {
-		return nil, data, fmt.Errorf("invalid string length: %v", err)
-	}
-	if length < 0 {
-		return nil, data, fmt.Errorf("invalid string length: %d (negative)", length)
+		return nil, data, fmt.Errorf("%w: invalid string length %q", ErrSyntax, data[:colon])
 	}
 
-	// Check we have enough data
+	// Compare against the remaining input instead of computing start+length,
+	// which can overflow for a crafted length.
 	start := colon + 1
-	if start+length > len(data) {
-		return nil, data, fmt.Errorf("invalid string: expected %d bytes, got %d", length, len(data)-start)
+	if length > len(data)-start {
+		return nil, data, fmt.Errorf("%w: string length %d exceeds %d remaining bytes", ErrSyntax, length, len(data)-start)
 	}
-
-	return string(data[start : start+length]), data[start+length:], nil
+	end := start + length
+	return string(data[start:end]), data[end:], nil
 }
 
 // decodeList decodes a bencode list in the form l<items>e.
-func decodeList(data []byte) (any, []byte, error) {
-	if len(data) == 0 || data[0] != 'l' {
-		return nil, data, fmt.Errorf("invalid list: missing 'l'")
+func decodeList(data []byte, depth int) (any, []byte, error) {
+	if depth > MaxDepth {
+		return nil, data, ErrTooDeep
 	}
 
 	list := make([]any, 0)
-	idx := 1
+	rest := data[1:]
 	for {
-		if idx >= len(data) {
-			return nil, data, fmt.Errorf("invalid list: missing 'e'")
+		if len(rest) == 0 {
+			return nil, data, fmt.Errorf("%w: list missing 'e'", ErrSyntax)
 		}
-		if data[idx] == 'e' {
-			return list, data[idx+1:], nil
+		if rest[0] == 'e' {
+			return list, rest[1:], nil
 		}
-
-		item, rest, err := Decode(data[idx:])
+		item, next, err := decode(rest, depth)
 		if err != nil {
 			return nil, data, err
 		}
 		list = append(list, item)
-
-		consumed := len(data[idx:]) - len(rest)
-		idx += consumed
+		rest = next
 	}
 }
 
 // decodeDict decodes a bencode dictionary in the form d<items>e.
-func decodeDict(data []byte) (map[string]any, []byte, error) {
-	if len(data) == 0 || data[0] != 'd' {
-		return nil, data, fmt.Errorf("invalid dict: missing 'd'")
+func decodeDict(data []byte, depth int) (any, []byte, error) {
+	if depth > MaxDepth {
+		return nil, data, ErrTooDeep
 	}
 
 	dict := make(map[string]any)
-	idx := 1
+	rest := data[1:]
 	for {
-		if idx >= len(data) {
-			return nil, data, fmt.Errorf("invalid dict: missing 'e'")
+		if len(rest) == 0 {
+			return nil, data, fmt.Errorf("%w: dict missing 'e'", ErrSyntax)
 		}
-		if data[idx] == 'e' {
-			return dict, data[idx+1:], nil
+		if rest[0] == 'e' {
+			return dict, rest[1:], nil
 		}
 
-		keyVal, rest, err := Decode(data[idx:])
+		keyVal, next, err := decodeString(rest)
 		if err != nil {
-			return nil, data, err
+			return nil, data, fmt.Errorf("dict key: %w", err)
 		}
-		key, ok := keyVal.(string)
-		if !ok {
-			return nil, data, fmt.Errorf("invalid dict key: expected string, got %T", keyVal)
-		}
-		consumed := len(data[idx:]) - len(rest)
-		idx += consumed
-
-		if idx >= len(data) {
-			return nil, data, fmt.Errorf("invalid dict: missing value for key %q", key)
+		key := keyVal.(string)
+		if _, duplicate := dict[key]; duplicate {
+			return nil, data, fmt.Errorf("%w: duplicate dict key %q", ErrNonCanonical, key)
 		}
 
-		value, rest, err := Decode(data[idx:])
+		value, next, err := decode(next, depth)
 		if err != nil {
 			return nil, data, err
 		}
 		dict[key] = value
-		consumed = len(data[idx:]) - len(rest)
-		idx += consumed
+		rest = next
 	}
 }

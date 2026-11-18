@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/itxkarthik/swarmrail/internal/peer"
+	"github.com/itxkarthik/swarmrail/internal/piece"
+	"github.com/itxkarthik/swarmrail/internal/torrent"
 	"github.com/itxkarthik/swarmrail/internal/tracker"
 )
 
@@ -114,4 +119,66 @@ func deadline(t *testing.T, ctx context.Context) time.Time {
 		t.Fatal("announce context has no deadline")
 	}
 	return value
+}
+
+func eventTracker(t *testing.T) (*httptest.Server, <-chan url.Values) {
+	t.Helper()
+	got := make(chan url.Values, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.URL.Query()
+		_, _ = w.Write([]byte("d8:intervali60e5:peers0:e"))
+	}))
+	t.Cleanup(server.Close)
+	return server, got
+}
+
+func TestSendTrackerEventStoppedSurvivesCancelledContext(t *testing.T) {
+	server, got := eventTracker(t)
+	tf := &torrent.TorrentFile{Name: "x", Length: 4, PieceLength: 4, PieceHashes: make([][20]byte, 1), AnnounceList: []string{server.URL}}
+	m := piece.NewManager(tf, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown has already begun
+	sendTrackerEvent(ctx, tf, m, [20]byte{1}, 6881, tracker.EventStopped, true)
+
+	select {
+	case q := <-got:
+		if q.Get("event") != "stopped" {
+			t.Fatalf("event = %q, want stopped", q.Get("event"))
+		}
+	default:
+		t.Fatal("tracker did not receive the stopped event")
+	}
+}
+
+func TestSendTrackerEventCompletedReportsNothingLeft(t *testing.T) {
+	server, got := eventTracker(t)
+	tf := &torrent.TorrentFile{Name: "x", Length: 4, PieceLength: 4, PieceHashes: make([][20]byte, 1), AnnounceList: []string{server.URL}}
+	m := piece.NewManager(tf, nil)
+	m.SetCompleted([]bool{true})
+
+	sendTrackerEvent(context.Background(), tf, m, [20]byte{1}, 6881, tracker.EventCompleted, true)
+	q := <-got
+	if q.Get("event") != "completed" || q.Get("left") != "0" {
+		t.Fatalf("event=%q left=%q, want completed and 0", q.Get("event"), q.Get("left"))
+	}
+}
+
+func TestSendTrackerEventIsBounded(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	tf := &torrent.TorrentFile{Name: "x", Length: 4, PieceLength: 4, PieceHashes: make([][20]byte, 1), AnnounceList: []string{server.URL}}
+
+	start := time.Now()
+	sendTrackerEvent(context.Background(), tf, piece.NewManager(tf, nil), [20]byte{1}, 6881, tracker.EventStopped, true)
+	if elapsed := time.Since(start); elapsed > trackerEventTimeout+time.Second {
+		t.Fatalf("stopped announce took %s, want at most about %s", elapsed, trackerEventTimeout)
+	}
 }

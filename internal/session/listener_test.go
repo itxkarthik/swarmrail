@@ -179,3 +179,38 @@ func TestInboundPeerCompletesWaitingDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestInboundPeerReceivesBitfieldFirst(t *testing.T) {
+	data := []byte("data")
+	tf := &torrent.TorrentFile{Name: "seed.bin", Length: 4, PieceLength: 4, PieceHashes: [][20]byte{sha1.Sum(data)}, InfoHash: [20]byte{1}}
+	manager := piece.NewManager(tf, nil)
+	manager.SetCompleted([]bool{true})
+	listener, err := NewPeerListener("127.0.0.1:0", tf, [20]byte{2}, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- listener.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := peer.Handshake(conn, tf.InfoHash, [20]byte{3}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	msg, err := peer.ReadMessage(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.ID != peer.MsgBitfield || len(msg.Payload) != 1 || msg.Payload[0] != 0x80 {
+		t.Fatalf("first message = %+v, want bitfield 0x80", msg)
+	}
+}

@@ -203,9 +203,10 @@ func (m *Model) refreshSources(width int) {
 	rows := make([]table.Row, 0)
 	for _, source := range m.m.SourceSnapshots() {
 		kind := string(source.Kind)
-		if source.Direction == "inbound" {
+		switch source.Direction {
+		case "inbound":
 			kind = "peer/in"
-		} else if source.Direction == "outbound" {
+		case "outbound":
 			kind = "peer/out"
 		}
 		rows = append(rows, table.Row{kind, source.Endpoint, source.State})

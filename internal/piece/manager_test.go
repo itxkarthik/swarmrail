@@ -271,7 +271,7 @@ func newServingPeer(t *testing.T, bitfield []bool, pieceData []byte) (*peer.Peer
 	client, server := net.Pipe()
 	connection := peer.NewPeerConnection(client, [20]byte{})
 	connection.SetBitfield(bitfield)
-	connection.Start()
+	connection.Start(nil)
 
 	go func() {
 		_ = peer.WriteMessage(server, &peer.Message{ID: peer.MsgUnchoke})

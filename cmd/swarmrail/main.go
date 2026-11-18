@@ -23,6 +23,9 @@ import (
 const (
 	trackerDiscoveryTimeout = 3 * time.Second
 	trackerFallbackTimeout  = 10 * time.Second
+	// trackerEventTimeout bounds the completed and stopped announces so an
+	// unreachable tracker cannot hold up completion or shutdown.
+	trackerEventTimeout = 2 * time.Second
 )
 
 type announcePeersFunc func(context.Context) ([]tracker.Peer, error)
@@ -43,6 +46,33 @@ func announceToTracker(ctx context.Context, announceURLs []string, request track
 		}
 	}
 	return discovery, err
+}
+
+// sendTrackerEvent announces a lifecycle event (completed or stopped) to every
+// tracker. "stopped" is sent precisely when ctx has been cancelled, so the
+// announce runs on a context that keeps ctx's values but not its
+// cancellation, bounded by trackerEventTimeout.
+func sendTrackerEvent(ctx context.Context, tf *torrent.TorrentFile, m *piece.Manager, peerID [20]byte, port uint16, event tracker.AnnounceEvent, quiet bool) {
+	if len(tf.AnnounceList) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), trackerEventTimeout)
+	defer cancel()
+	completed := m.CompletedBytes()
+	_, _ = announceToTracker(ctx, tf.AnnounceList, tracker.AnnounceRequest{
+		InfoHash:   tf.InfoHash,
+		PeerID:     peerID,
+		Port:       port,
+		Downloaded: completed,
+		Uploaded:   m.UploadedBytes(),
+		Left:       m.TotalLength() - completed,
+		Event:      event,
+	}, quiet)
+}
+
+// isComplete reports whether every piece is verified.
+func isComplete(m *piece.Manager) bool {
+	return piece.CountCompleted(m.Completed()) == m.TotalPieces()
 }
 
 // discoverPeerConnections performs a fast discovery pass and, when requested,
@@ -114,15 +144,21 @@ func mergeConnectReports(reports ...peer.ConnectReport) peer.ConnectReport {
 }
 
 func run() error {
-	port := flag.Int("port", 6881, "listen port for incoming connections")
-	output := flag.String("output", "", "output directory (default: torrent name)")
+	port := flag.Int("port", 6881, "listen port for incoming connections (0 picks a free port)")
+	output := flag.String("output", "", "output directory (default: current directory)")
 	tuiMode := flag.Bool("tui", false, "terminal UI mode")
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: swarmrail [flags] <torrent-file>")
+		fmt.Fprintln(flag.CommandLine.Output(), "\nFlags:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	ctx, stop := signalNotifyContext(context.Background())
 	defer stop()
 
 	if flag.NArg() < 1 {
-		return fmt.Errorf("Usage: swarmrail [flags] <torrent-file>\nFlags:\n  --port   listen port (default: 6881)\n  --output output directory\n  --tui    terminal UI mode")
+		flag.Usage()
+		return errUsage
 	}
 	if *port < 0 || *port > 65535 {
 		return fmt.Errorf("invalid listen port %d: must be between 0 and 65535", *port)
@@ -214,7 +250,7 @@ func run() error {
 				return discovery.Peers, announceErr
 			},
 			func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
-				return peer.ConnectToPeersWithID(&tf, discovered, peerID)
+				return peer.ConnectToPeersWithContext(ctx, &tf, discovered, peerID, m.BitfieldMessage)
 			},
 			func(status string) { fmt.Println(status) },
 		)
@@ -228,6 +264,10 @@ func run() error {
 	} else if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 		return fmt.Errorf("torrent has no tracker announce URL or webseed URL")
 	}
+	// BEP 3: tell trackers we are leaving so they stop handing out our
+	// address. Deferred before the reannounce loop's cleanup so that loop
+	// has stopped by the time this runs.
+	defer sendTrackerEvent(ctx, &tf, m, peerID, announcePort, tracker.EventStopped, false)
 	fmt.Printf("Got %d peers from tracker\n", len(peers))
 
 	fmt.Printf("Connected to %d peers\n", len(connections))
@@ -267,8 +307,12 @@ func run() error {
 		piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
 		float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
 
+	alreadyComplete := isComplete(m)
 	if err := m.Download(ctx, outputPath, true); err != nil {
 		return fmt.Errorf("download failed: %w", err)
+	}
+	if !alreadyComplete {
+		sendTrackerEvent(ctx, &tf, m, peerID, announcePort, tracker.EventCompleted, false)
 	}
 
 	piece.RemoveResume(statePath)
@@ -289,6 +333,11 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 	m.SetStatus("Connecting trackers...")
 
 	go func() {
+		// Report the result only after every deferred cleanup below (the
+		// stopped announce, closing peers, stopping reannounce) has run, so
+		// the process cannot exit before shutdown finishes.
+		var downloadErr error
+		defer func() { workerResult <- downloadErr }()
 		var (
 			peers           []tracker.Peer
 			connections     []*peer.PeerConnection
@@ -319,7 +368,7 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 					return discovery.Peers, err
 				},
 				func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
-					return peer.ConnectToPeersWithID(tf, discovered, peerID)
+					return peer.ConnectToPeersWithContext(ctx, tf, discovered, peerID, m.BitfieldMessage)
 				},
 				m.SetStatus,
 			)
@@ -329,6 +378,7 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 			m.SetStatus("Tracker discovery failed; waiting for inbound peers")
 		}
 
+		defer sendTrackerEvent(ctx, tf, m, peerID, port, tracker.EventStopped, true)
 		m.AddPeers(connections)
 		defer closePeerConnections(m.Peers)
 
@@ -369,12 +419,16 @@ func runTUIFlow(parent context.Context, m *piece.Manager, statePath, outputPath 
 			}()
 		}
 
+		alreadyComplete := isComplete(m)
 		err := m.Download(ctx, outputPath, true)
 		if err == nil {
+			if !alreadyComplete {
+				sendTrackerEvent(ctx, tf, m, peerID, port, tracker.EventCompleted, true)
+			}
 			piece.RemoveResume(statePath)
 		}
+		downloadErr = err
 		doneCh <- err
-		workerResult <- err
 	}()
 
 	tuiErr := tui.Run(m, doneCh, controller, cancel, peerListener)
@@ -399,8 +453,14 @@ func closePeerConnections(peers func() []*peer.PeerConnection) {
 	}
 }
 
+// errUsage reports invalid command-line arguments after usage was printed.
+var errUsage = errors.New("invalid arguments")
+
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errUsage) {
+			os.Exit(2)
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

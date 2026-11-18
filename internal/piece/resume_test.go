@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -141,5 +142,36 @@ func resumeTestTorrent(name string, pieces ...[]byte) *torrent.TorrentFile {
 	return &torrent.TorrentFile{
 		Name: name, InfoHash: infoHash, PieceLength: int64(len(pieces[0])),
 		Length: total, PieceHashes: hashes,
+	}
+}
+
+// Verifying one piece must only touch the files that piece overlaps. Building
+// a path for every file on every piece made resume of a many-file torrent
+// quadratic (files x pieces).
+func TestResumePieceReadCostIndependentOfFileCount(t *testing.T) {
+	const files = 10000
+	dir := t.TempDir()
+	tf := &torrent.TorrentFile{Name: "many", PieceLength: 1, Length: files}
+	for i := range files {
+		tf.Files = append(tf.Files, torrent.FileEntry{Length: 1, Path: []string{"f" + strconv.Itoa(i)}})
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "many"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "many", "f0"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	layout := newPayloadLayout(dir, tf)
+	allocs := testing.AllocsPerRun(20, func() {
+		data, err := layout.readPiece(0)
+		if err != nil || string(data) != "x" {
+			t.Fatalf("readPiece(0) = %q, %v", data, err)
+		}
+	})
+	// Opening one file costs a handful of allocations; one per file in the
+	// torrent would be at least 10,000.
+	if allocs > 50 {
+		t.Fatalf("readPiece allocated %.0f times for a one-file piece of a %d-file torrent", allocs, files)
 	}
 }
