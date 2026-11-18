@@ -93,12 +93,43 @@ func buildAnnounceURL(base *url.URL, request AnnounceRequest) string {
 		"&peer_id=" + escapeBinary(request.PeerID[:]) +
 		"&" + params.Encode()
 	u := *base
-	if u.RawQuery != "" {
-		query = u.RawQuery + "&" + query
+	if extra := trackerOnlyQuery(u.RawQuery); extra != "" {
+		query = extra + "&" + query
 	}
 	u.RawQuery = query
 	u.Fragment = ""
 	return u.String()
+}
+
+// announceFields are the parameters SwarmRail sets on every announce.
+var announceFields = map[string]bool{
+	"info_hash": true, "peer_id": true, "port": true, "uploaded": true,
+	"downloaded": true, "left": true, "compact": true, "key": true, "event": true,
+}
+
+// trackerOnlyQuery keeps the announce URL's own parameters (a private
+// tracker's passkey, for example) byte for byte, but drops any that
+// SwarmRail sets itself. Otherwise a URL carrying "?event=started" would
+// send a stale first value that many trackers read instead of ours.
+func trackerOnlyQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	kept := make([]string, 0, strings.Count(raw, "&")+1)
+	for pair := range strings.SplitSeq(raw, "&") {
+		if pair == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(pair, "=")
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if announceFields[name] {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	return strings.Join(kept, "&")
 }
 
 // escapeBinary percent-encodes every byte outside the RFC 3986 unreserved

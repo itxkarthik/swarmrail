@@ -43,6 +43,27 @@ func TestAnnounceURLPreservesTrackerQuery(t *testing.T) {
 	}
 }
 
+// Announce fields already in the tracker URL must not shadow the current
+// values: a tracker reading the first value would otherwise see a stale
+// event, left, port or info_hash.
+func TestAnnounceURLReplacesConflictingTrackerFields(t *testing.T) {
+	base, _ := url.Parse("http://tracker.example/announce?passkey=abc&event=started&left=100&%70ort=1&info_hash=stale&Key=keep")
+	got := buildAnnounceURL(base, AnnounceRequest{Port: 6881, Left: 0, Event: EventStopped})
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	for field, want := range map[string]string{"event": "stopped", "left": "0", "port": "6881", "passkey": "abc", "Key": "keep"} {
+		if vals := q[field]; len(vals) != 1 || vals[0] != want {
+			t.Errorf("%s = %q, want exactly [%q] in %q", field, vals, want, got)
+		}
+	}
+	if vals := q["info_hash"]; len(vals) != 1 || vals[0] == "stale" {
+		t.Errorf("info_hash = %q, want only the current value", vals)
+	}
+}
+
 func TestHTTPAnnounceInfoHashRoundTripsThroughServer(t *testing.T) {
 	var infoHash, peerID [20]byte
 	for i := range infoHash {
